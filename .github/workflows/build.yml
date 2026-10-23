@@ -25,16 +25,19 @@ jobs:
       - name: Build release
         run: ./bin/bundle.sh
 
-      - name: Zip
+      - name: Zip App & CLI
         run: |
-          ditto -c -k --sequesterRsrc --keepParent LLMUsage.app LLMUsage.zip
-          ls -la LLMUsage.zip
+          ditto -c -k --sequesterRsrc --keepParent DevTools.app DevTools.zip
+          gzip -c .build/release/ws > ws-darwin-arm64.gz
+          ls -la DevTools.zip ws-darwin-arm64.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LLMUsage-${{ github.sha }}
-          path: LLMUsage.zip
+          name: DevTools-${{ github.sha }}
+          path: |
+            DevTools.zip
+            ws-darwin-arm64.gz
           if-no-files-found: error
           retention-days: 90
 
@@ -67,6 +70,8 @@ jobs:
           tag_name: ${{ steps.bump.outputs.tag || github.ref_name }}
           name: ${{ steps.bump.outputs.tag || github.ref_name }}
           generate_release_notes: true
-          files: LLMUsage.zip
+          files: |
+            DevTools.zip
+            ws-darwin-arm64.gz
           prerelease: false
           fail_on_unmatched_files: true

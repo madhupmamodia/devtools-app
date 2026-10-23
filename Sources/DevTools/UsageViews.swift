@@ -1,43 +1,7 @@
 import SwiftUI
 import AppKit
 
-@main
-struct LLMUsageApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var store = UsageStore()
-
-    var body: some Scene {
-        MenuBarExtra {
-            MenuContent(store: store)
-        } label: {
-            Image(systemName: "chart.bar.fill")
-        }
-        .menuBarExtraStyle(.window)
-    }
-}
-
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-    }
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        false
-    }
-}
-
-struct MenuContent: View {
-    @ObservedObject var store: UsageStore
-
-    var body: some View {
-        if store.needsSetup {
-            SetupView(store: store)
-        } else if store.showCustomRange {
-            CustomRangeView(store: store)
-        } else {
-            StatsView(store: store)
-        }
-    }
-}
+// Views extracted from original LLMUsage App
 
 struct SetupView: View {
     @ObservedObject var store: UsageStore

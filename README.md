@@ -1,114 +1,53 @@
-# LLM Usage — Menu Bar + Desktop Widget
+# DevTools
 
-Menu bar widget for LiteLLM-compatible LLM gateways. Configurable URL, no defaults.
+Developer tools and AI workspace orchestrator for macOS. Combines LLM usage telemetry with multi-repository task workspace management for AI coding agents.
 
-## Install
+## Features
 
+- **Workspaces Tab & `ws` CLI**:
+  - Task-isolated multi-repo Git worktrees (`~/workspaces/<TICKET>`).
+  - Shared bare clone mirror cache (`~/.cache/ws/repos/`) — instant zero-duplicate checkouts.
+  - Automatic cross-repo AST code intelligence indexing via `codebase-memory-mcp`.
+  - Auto-configures MCP server for Cursor, Claude Code, and OpenCode.
+  - Auto-installs `post-commit` Git hooks to keep the graph fresh on code edits.
+  - System Readiness Doctor: 1-click check and fix for `git`, `gh`, `node`, `python3`, `codebase-memory-mcp`, and AI agent CLIs.
+
+- **LLM Usage Tab**:
+  - Real-time spend, requests, and token telemetry from Multiplier's LiteLLM Gateway.
+  - Rolling 7-day budget tracking with reset countdown.
+  - Latency (p50/p95), error rates, and cache hit metrics.
+  - Model pricing catalog and 1-click agent configuration model sync (`opencode`, `pi`, `codex`, `hermes`).
+
+---
+
+## Installation
+
+### 1. Build and install locally
 ```bash
-git clone https://github.com/madhupmamodia/llm-usage.git
-cd llm-usage
 ./bin/bundle.sh --install
 ```
+This builds `DevTools.app`, installs it to `/Applications`, and links the CLI tool `ws` to `/usr/local/bin/ws`.
 
-The script checks for Swift + codesign + accepted Xcode license and prints a fix command if anything is missing. Fresh Mac? Run `xcode-select --install` and `sudo xcodebuild -license accept` first.
+---
 
-Builds locally + installs to `/Applications` + launches. No download, no Gatekeeper prompt (locally-built apps aren't quarantined, and the bundle script strips any inherited xattrs).
-
-To update later: `git pull && ./bin/bundle.sh --install`.
-To uninstall: `./bin/bundle.sh --uninstall`.
-
-## Update
-
-App version is shown in the menu bar: click the chart icon, the title bar shows `LLM Usage`.
-
-### From a git clone (recommended)
+## CLI Usage (`ws`)
 
 ```bash
-cd ~/path/to/llm-usage
-git pull
-./bin/bundle.sh --install
+# Verify system prerequisites & agents
+ws doctor
+
+# Auto-fix missing prerequisites
+ws doctor --fix
+
+# Create multi-repo workspace for a JIRA ticket
+ws create FINX-1234 multiplier-frontend billing-service
+
+# List active workspaces and dirty git status
+ws list
+
+# Re-index semantic code graph via codebase-memory-mcp
+ws reindex FINX-1234
+
+# Safely prune workspace when done (checks for uncommitted code)
+ws prune FINX-1234
 ```
-
-The script kills the running instance, rebuilds, copies to `/Applications`, and relaunches. Config in `~/.llm-usage-*` is preserved.
-
-### From a pre-built release
-
-```bash
-# Download LLMUsage.zip from https://github.com/madhupmamodia/llm-usage/releases
-# Then:
-rm -rf /Applications/LLMUsage.app
-unzip -o ~/Downloads/LLMUsage.zip -d /Applications/
-open /Applications/LLMUsage.app
-```
-
-First launch after replacing the bundle: right-click → Open → "Open" to clear Gatekeeper (one-time per machine).
-
-### Check your version
-
-```bash
-defaults read /Applications/LLMUsage.app/Contents/Info CFBundleShortVersionString
-```
-
-CI auto-cuts a new version on every push to `main`. The `Latest` release is always the most recent.
-
-## Releases (alternative)
-
-→ https://github.com/madhupmamodia/llm-usage/releases
-
-Pre-built `LLMUsage.zip` available if you don't want to clone+build. **Ad-hoc signed** (no Apple Dev account) — on first launch macOS shows Gatekeeper. Workaround: right-click `LLMUsage.app` → Open → "Open" in dialog. Once done, app is trusted forever.
-
-Every push to `main` auto-cuts a new version (`v1.0.0` → `v1.0.1` → …). To bump minor/major manually:
-```bash
-git tag v1.1.0 && git push --tags
-```
-
-## Screenshots
-
-![Main view — stats, budget bar, top models](docs/screenshots/main.png)
-
-![Setup view — first launch, paste API key + URL](docs/screenshots/setup.png)
-
-## Configure
-
-On first launch, the setup screen asks for:
-- **API key** — your gateway API key
-- **Gateway URL** — full URL to your LiteLLM instance (e.g. `https://llm-gateway.example.com`)
-- **user_id** — optional, scopes spend to your account only
-
-Saved to mode 600 files in `$HOME`:
-```bash
-~/.llm-usage-key       # API key
-~/.llm-usage-config    # Gateway URL
-~/.llm-usage-user      # user_id (optional)
-```
-
-### Auto-detect from `~/.zshrc`
-
-If `~/.llm-usage-key` is missing, the app parses `~/.zshrc` for `LITELLM_API_KEY="..."` and pre-fills the setup screen (badged "detected from ~/.zshrc"). Edit, replace, or save as-is — your choice.
-
-## Auto-start at login
-
-`System Settings → General → Login Items → Open at Login → + → ~/workspace/llm-usage/LLMUsage.app`
-
-## Desktop widget (later)
-
-The `Widget/` directory is the Swift source + Info.plist + entitlements for a real `WidgetKit` widget. To build it:
-
-1. Install full Xcode (`xcode-select --install` won't work — App Store → Xcode).
-2. Open Xcode → File → New → Project → macOS → App (SwiftUI). Name it `LLMUsage`.
-3. File → New → Target → Widget Extension → name `LLMUsageWidget`, uncheck "Include Configuration Intent".
-4. In the new target, replace its generated `.swift` and `Info.plist` with the files in `Widget/`.
-5. Signing & Capabilities → select your team.
-6. Build & run the app once (so the widget is registered), then right-click desktop → "Add Widget" → search `LLM Usage`.
-
-The widget reads the same `~/.llm-usage-*` files as the menu bar app.
-
-## Files
-
-- `Package.swift` — SPM manifest for the menu bar app.
-- `Sources/llm-usage/` — Swift sources (Models, UsageStore, App).
-- `bin/bundle.sh` — rebuild script (`./bin/bundle.sh` to refresh `LLMUsage.app`).
-- `Resources/Info.plist` — bundle metadata.
-- `LLMUsage.app/` — built bundle. `open LLMUsage.app` to run.
-- `Widget/` — Xcode widget extension sources for later.
-- `.github/workflows/build.yml` — CI: build + auto-bump version + release on every push.
