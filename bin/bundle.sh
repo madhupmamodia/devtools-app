@@ -62,13 +62,16 @@ if $DO_INSTALL; then
   rm -rf "$INSTALL_DIR/$APP_DIR"
   mv "$APP_DIR" "$INSTALL_DIR/$APP_DIR"
   
-  echo "Linking 'ws' to /usr/local/bin/ws..."
-  mkdir -p /usr/local/bin 2>/dev/null || true
+  echo "Installing 'ws' CLI..."
+  USER_BIN="$HOME/.local/bin"
+  mkdir -p "$USER_BIN"
+  cp ".build/release/ws" "$USER_BIN/ws"
+  chmod +x "$USER_BIN/ws"
+  echo "CLI installed to $USER_BIN/ws"
+  
   if cp ".build/release/ws" "/usr/local/bin/ws" 2>/dev/null; then
     chmod +x "/usr/local/bin/ws"
-    echo "CLI installed to /usr/local/bin/ws"
-  else
-    echo "Notice: Could not write to /usr/local/bin (requires sudo). Try: sudo cp .build/release/ws /usr/local/bin/"
+    echo "CLI also linked to /usr/local/bin/ws"
   fi
   
   open "$INSTALL_DIR/$APP_DIR"

@@ -28,6 +28,23 @@ struct WSCli {
             let repos = Array(args.dropFirst(2)).filter { !$0.hasPrefix("-") }
             handleCreate(engine: engine, ticket: ticket, repos: repos)
             
+        case "add":
+            guard args.count >= 3 else {
+                print("Error: Usage: ws add <workspace> <repo> [repo...]")
+                exit(1)
+            }
+            let wsName = args[1]
+            let repos = Array(args.dropFirst(2)).filter { !$0.hasPrefix("-") }
+            do {
+                try engine.addRepos(toWorkspace: wsName, repoNames: repos) { progress in
+                    print("  -> \(progress)")
+                }
+                print("\nDone. Added to \(wsName): \(repos.joined(separator: ", "))")
+            } catch {
+                print("\nError: \(error.localizedDescription)")
+                exit(1)
+            }
+            
         case "reindex":
             guard args.count >= 2 else {
                 print("Error: Ticket/workspace name required. e.g. 'ws reindex FINX-1234'")
@@ -56,7 +73,10 @@ struct WSCli {
             }
             
         case "repos":
-            handleRepos(engine: engine, json: args.contains("--json"))
+            handleRepos(engine: engine, json: args.contains("--json"), sync: args.contains("--sync"))
+
+        case "usage":
+            handleUsage(engine: engine, sync: args.contains("--sync"), days: daysArg(args))
             
         default:
             printUsage()
@@ -72,9 +92,11 @@ struct WSCli {
           ws doctor [--fix] [--json]       Check system prerequisites & AI agents
           ws list [--json]                 List active workspaces and git status
           ws create <ticket> [repos...]    Create worktrees and index with CMB
+          ws add <ws> <repo...>      Add repos to an existing workspace
           ws reindex <name>                Re-run codebase-memory-mcp index
           ws prune <name> [--force]        Safely remove worktrees and workspace
-          ws repos [--json]                List configured repositories
+          ws repos [--json] [--sync]      List configured repositories, or refresh from GitHub org
+          ws usage [--sync] [--days N]  Rank repos by your own PR/commit activity
         """)
     }
     
@@ -145,8 +167,8 @@ struct WSCli {
         let repoSelection = repos.isEmpty ? engine.config.repos.map { $0.name } : repos
         print("Provisioning workspace for \(ticket) with repos: \(repoSelection.joined(separator: ", "))...")
         do {
-            let path = try engine.createWorkspace(ticket: ticket, selectedRepoNames: repoSelection) { progress in
-                print("  -> \(progress)")
+            let path = try engine.createWorkspace(ticket: ticket, selectedRepoNames: repoSelection) { ev in
+                print("  -> \(describe(ev))")
             }
             print("\nDone. Workspace ready at:\ncd \(path)")
         } catch {
@@ -155,15 +177,83 @@ struct WSCli {
         }
     }
     
-    static func handleRepos(engine: WorkspaceEngine, json: Bool) {
+    static func daysArg(_ args: [String]) -> Int {
+        guard let i = args.firstIndex(of: "--days"), i + 1 < args.count, let n = Int(args[i + 1]) else {
+            return 365
+        }
+        return n
+    }
+    
+    static func handleUsage(engine: WorkspaceEngine, sync: Bool, days: Int) {
+        if sync {
+            guard let usage = engine.syncRepoUsage(sinceDays: days) else {
+                print("Usage fetch failed. Check 'gh auth status'.")
+                exit(1)
+            }
+            print("Ranked by PR/commit activity since \(days) days ago (\(usage.login)).\n")
+            let ranked = engine.config.repos
+                .map { ($0.name, engine.usageScore(for: $0.name, usage: usage)) }
+                .filter { $0.1 > 0 }
+                .sorted { $0.1 > $1.1 }
+            guard !ranked.isEmpty else {
+                print("No activity found.")
+                return
+            }
+            for (i, entry) in ranked.enumerated() {
+                let prs = usage.prCounts[entry.0] ?? 0
+                let commits = usage.commitCounts[entry.0] ?? 0
+                print(String(format: "%2d. %-40@  %4d PRs  %4d commits  (score %d)", i + 1, entry.0 as NSString, prs, commits, entry.1))
+            }
+            return
+        }
+        guard let usage = engine.loadRepoUsage() else {
+            print("No cached usage. Run: ws usage --sync")
+            return
+        }
+        print("Cached usage for \(usage.login) fetched \(usage.fetchedAt).")
+        let ranked = usage.prCounts
+            .map { ($0.key, $0.value) }
+            .sorted { $0.1 > $1.1 }
+        for (i, entry) in ranked.enumerated() {
+            print(String(format: "%2d. %-40@  %4d PRs", i + 1, entry.0 as NSString, entry.1))
+        }
+    }
+    
+    static func describe(_ ev: WorkspaceEngine.ProvisionEvent) -> String {
+        switch ev {
+        case .repoStarted(let r): return "\(r): starting"
+        case .repoPhase(let r, let p): return "\(r): \(p.rawValue)"
+        case .indexing: return "indexing semantic graph"
+        case .complete(let path): return "ready at \(path)"
+        }
+    }
+    
+    static func handleRepos(engine: WorkspaceEngine, json: Bool, sync: Bool) {
+        if sync {
+            let count = engine.syncReposFromGitHub()
+            if count == 0 {
+                print("Sync failed. Check 'gh auth status' and org access.")
+                exit(1)
+            }
+            if json {
+                let data = (try? JSONEncoder().encode(engine.config.repos)) ?? Data()
+                print(String(data: data, encoding: .utf8) ?? "[]")
+                return
+            }
+            print("Synced \(count) repos from \(engine.config.defaultOrg).")
+            return
+        }
         if json {
             let data = (try? JSONEncoder().encode(engine.config.repos)) ?? Data()
             print(String(data: data, encoding: .utf8) ?? "[]")
             return
         }
-        print("\n=== Configured Repositories ===")
+        print("\n=== Configured Repositories (\(engine.config.repos.count)) ===")
         for r in engine.config.repos {
             print("• \(r.name) (\(r.defaultBranch)) -> \(r.cloneUrl)")
+        }
+        if engine.config.repos.isEmpty {
+            print("No repos cached. Run: ws repos --sync")
         }
         print("")
     }

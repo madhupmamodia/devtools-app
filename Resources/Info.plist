@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>llm-usage</string>
+    <string>DevTools</string>
     <key>CFBundleIdentifier</key>
-    <string>com.madhup.llm-usage</string>
+    <string>com.madhup.devtools</string>
     <key>CFBundleName</key>
-    <string>LLMUsage</string>
+    <string>DevTools</string>
     <key>CFBundleDisplayName</key>
-    <string>LLM Usage</string>
+    <string>DevTools</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>

@@ -17,18 +17,8 @@ public final class WorkspaceEngine: @unchecked Sendable {
            let loaded = try? JSONDecoder().decode(WSConfig.self, from: data) {
             self.config = loaded
         } else {
-            // Default Multiplier Repos
-            var cfg = WSConfig()
-            cfg.repos = [
-                RepoDefinition(name: "multiplier-frontend", cloneUrl: "git@github.com:Multiplier-Core/multiplier-frontend.git", defaultBranch: "main"),
-                RepoDefinition(name: "billing-service", cloneUrl: "git@github.com:Multiplier-Core/billing-service.git", defaultBranch: "main"),
-                RepoDefinition(name: "payable-service", cloneUrl: "git@github.com:Multiplier-Core/payable-service.git", defaultBranch: "main"),
-                RepoDefinition(name: "contract-service", cloneUrl: "git@github.com:Multiplier-Core/contract-service.git", defaultBranch: "main"),
-                RepoDefinition(name: "user-service", cloneUrl: "git@github.com:Multiplier-Core/user-service.git", defaultBranch: "main"),
-                RepoDefinition(name: "company-service", cloneUrl: "git@github.com:Multiplier-Core/company-service.git", defaultBranch: "main")
-            ]
-            self.config = cfg
-            if let data = try? JSONEncoder().encode(cfg) {
+            self.config = WSConfig()
+            if let data = try? JSONEncoder().encode(self.config) {
                 try? data.write(to: configURL)
             }
         }
@@ -40,6 +30,147 @@ public final class WorkspaceEngine: @unchecked Sendable {
         if let data = try? encoder.encode(config) {
             try? data.write(to: configURL)
         }
+    }
+    
+    // MARK: - Repo Discovery
+    
+    private struct GHRow: Decodable {
+        let name: String
+        let isArchived: Bool
+        let isFork: Bool
+        let defaultBranchRef: DefaultBranch?
+    }
+    private struct DefaultBranch: Decodable { let name: String }
+    
+    /// Fetches every active, non-fork repo in the org via GitHub CLI.
+    /// ponytail: gh repo list caps at 500; org is ~420 repos so one call is enough.
+    /// Raise --limit if the org ever exceeds that.
+    public func discoverRepos(org: String? = nil) -> [RepoDefinition] {
+        let orgName = org ?? config.defaultOrg
+        let cmd = "gh repo list \(orgName) --limit 500 --json name,isArchived,isFork,defaultBranchRef"
+        let res = ProcessRunner.run(cmd)
+        guard res.exitCode == 0,
+              let data = res.stdout.data(using: .utf8),
+              let rows = try? JSONDecoder().decode([GHRow].self, from: data)
+        else { return [] }
+        
+        let repos = rows
+            .filter { !$0.isArchived && !$0.isFork }
+            .map {
+                RepoDefinition(
+                    name: $0.name,
+                    // HTTPS + gh credential helper, not SSH. ponytail: SSH keys break
+                    // silently and only surface as "Permission denied (publickey)" deep
+                    // into a clone. gh's token already has repo scope for private orgs.
+                    cloneUrl: "https://github.com/\(orgName)/\($0.name).git",
+                    defaultBranch: $0.defaultBranchRef?.name ?? "main"
+                )
+            }
+            .sorted { $0.name < $1.name }
+        return repos
+    }
+    
+    /// Replaces cached repo list with a fresh org scan.
+    @discardableResult
+    public func syncReposFromGitHub(org: String? = nil) -> Int {
+        let found = discoverRepos(org: org)
+        guard !found.isEmpty else { return 0 }
+        config.repos = found
+        saveConfig()
+        return found.count
+    }
+    
+    // MARK: - Personal Repo Usage
+    
+    public struct RepoUsage: Codable {
+        public var login: String
+        public var org: String
+        public var fetchedAt: Date
+        public var prCounts: [String: Int]
+        public var commitCounts: [String: Int]
+    }
+    
+    private var usageURL: URL {
+        configURL.deletingLastPathComponent().appendingPathComponent("usage.json")
+    }
+    
+    public func loadRepoUsage() -> RepoUsage? {
+        guard let data = try? Data(contentsOf: usageURL) else { return nil }
+        return try? JSONDecoder().decode(RepoUsage.self, from: data)
+    }
+    
+    /// Counts PRs and commits the signed-in user authored per repo in the org.
+    /// ponytail: GitHub search caps at 1000 results and each 100-item page costs ~1s,
+    /// so this pages up to 10x only when total_count demands it. Cached to disk —
+    /// refresh is explicit, never on launch.
+    @discardableResult
+    public func syncRepoUsage(org: String? = nil, sinceDays: Int = 365) -> RepoUsage? {
+        let orgName = org ?? config.defaultOrg
+        let loginRes = ProcessRunner.run("gh api /user --jq .login")
+        guard loginRes.exitCode == 0 else { return nil }
+        let login = loginRes.stdout
+        
+        let since = Date().addingTimeInterval(-Double(sinceDays) * 86400)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        let cutoff = formatter.string(from: since)
+        
+        /// - Parameter repoExpr: a jq expression yielding the bare repo name per item.
+///   issues: `.items[].repository_url | split("/") | .[-1]`
+///     (search/items repository_url is truncated to .../repos/OWNER/REPO — no /pulls/N)
+///   commits: `.items[].repository.name`
+///   Endpoints and payload shapes differ — do not merge them.
+func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
+            var result: [String: Int] = [:]
+            
+            // Head request tells us total_count so we never over-page.
+            let head = ProcessRunner.run("gh api \"\(endpoint)?q=\(query)&per_page=100&page=1\" --jq '.total_count'")
+            guard head.exitCode == 0, let total = Int(head.stdout) else { return result }
+            let pages = max(1, min(10, Int(ceil(Double(total) / 100.0))))
+            
+            for p in 1...pages {
+                // --jq extracts repo names server-of-the-client-side, so the pipe
+                // carries ~40 bytes/line instead of the whole issue+body payload.
+                let res = ProcessRunner.run("gh api \"\(endpoint)?q=\(query)&per_page=100&page=\(p)\" --jq '\(repoExpr)'")
+                guard res.exitCode == 0 else { continue }
+                
+                for line in res.stdout.split(separator: "\n") {
+                    let repo = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !repo.isEmpty else { continue }
+                    result[repo, default: 0] += 1
+                }
+            }
+            return result
+        }
+        
+        let prs = count(endpoint: "search/issues",
+                        query: "author:\(login)+type:pr+org:\(orgName)+created:>=\(cutoff)",
+                        repoExpr: ".items[].repository_url | split(\"/\") | .[-1]")
+        let commits = count(endpoint: "search/commits",
+                            query: "author:\(login)+org:\(orgName)+author-date:>=\(cutoff)",
+                            repoExpr: ".items[].repository.name")
+        
+        let usage = RepoUsage(
+            login: login,
+            org: orgName,
+            fetchedAt: Date(),
+            prCounts: prs,
+            commitCounts: commits
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(usage) {
+            try? data.write(to: usageURL)
+        }
+        return usage
+    }
+    
+    /// Score used to rank "my repos". PRs weigh more than commits because a PR is a
+    /// deliberate unit of delivered work; commits include noise and reverts.
+    public func usageScore(for repo: String, usage: RepoUsage) -> Int {
+        (usage.prCounts[repo] ?? 0) * 3 + (usage.commitCounts[repo] ?? 0)
     }
     
     // MARK: - Doctor
@@ -72,7 +203,29 @@ public final class WorkspaceEngine: @unchecked Sendable {
             installCommand: "brew install gh && gh auth login"
         ))
         
-        // 3. Node.js & npm
+        // 3. Git clone auth. Verifies a real private repo is actually readable over
+        // the transport we use, so broken SSH keys surface here instead of mid-clone.
+        let probeRepo = config.repos.first?.name ?? ""
+        if !probeRepo.isEmpty {
+            let sshProbe = ProcessRunner.run("GIT_SSH_COMMAND='ssh -o BatchMode=yes' git ls-remote git@github.com:\(config.defaultOrg)/\(probeRepo).git HEAD", timeout: 20)
+            let httpsProbe = ProcessRunner.run("git ls-remote https://github.com/\(config.defaultOrg)/\(probeRepo).git HEAD", timeout: 20)
+            let sshOK = sshProbe.exitCode == 0
+            let httpsOK = httpsProbe.exitCode == 0
+            items.append(DoctorItem(
+                name: "Git clone auth",
+                command: "git ls-remote",
+                required: true,
+                installed: sshOK || httpsOK,
+                version: nil,
+                path: nil,
+                details: sshOK
+                    ? "SSH key works"
+                    : (httpsOK ? "SSH key missing; using HTTPS + gh token" : "No working transport"),
+                installCommand: sshOK ? nil : "gh auth setup-git"
+            ))
+        }
+        
+        // 4. Node.js & npm
         let nodeRes = ProcessRunner.run("which node && node -v")
         items.append(DoctorItem(
             name: "node",
@@ -110,24 +263,43 @@ public final class WorkspaceEngine: @unchecked Sendable {
             installCommand: "npm install -g codebase-memory-mcp"
         ))
         
-        // 6. Agents
-        let agents = [
-            ("opencode", "which opencode", "npm install -g opencode-ai"),
-            ("claude", "which claude", "npm install -g @anthropic-ai/claude-code"),
-            ("cursor", "test -d /Applications/Cursor.app || which cursor", "brew install --cask cursor"),
-            ("codex", "which codex", "brew install codex")
+        // 6. Terminals. iTerm2 preferred when present; plain Terminal always exists.
+        let iterm = ProcessRunner.run("test -d /Applications/iTerm.app")
+        items.append(DoctorItem(
+            name: "iTerm2",
+            command: "iTerm",
+            required: false,
+            installed: iterm.exitCode == 0,
+            version: nil,
+            path: iterm.exitCode == 0 ? "/Applications/iTerm.app" : nil,
+            details: iterm.exitCode == 0 ? "Preferred terminal for 'Open in'" : "Not installed — falling back to Terminal.app",
+            installCommand: "brew install --cask iterm2"
+        ))
+        
+        // 6. Coding agents (optional — user installs only what they want).
+        // ponytail: macOS filesystem is case-insensitive, so /Applications/OpenCode.app
+        // and /Applications/opencode.app are the same app. Only check one.
+        let agents: [(String, String, String?, String)] = [
+            ("OpenCode", "opencode --version", "npm install -g opencode-ai", "CLI agent (TUI)"),
+            ("OpenCode Desktop", "test -d /Applications/OpenCode.app", "brew install --cask opencode", "Desktop app"),
+            ("Claude Code", "claude --version", "npm install -g @anthropic-ai/claude-code", "CLI agent"),
+            ("Cursor", "test -d /Applications/Cursor.app", "brew install --cask cursor", "Desktop editor"),
+            ("Codex", "codex --version", "npm install -g @openai/codex", "CLI agent")
         ]
         
-        for (agentName, checkCmd, installCmd) in agents {
-            let res = ProcessRunner.run(checkCmd)
+        for (agentName, checkCmd, installCmd, note) in agents {
+            let res = ProcessRunner.run(checkCmd, timeout: 15)
+            let found = res.exitCode == 0
             items.append(DoctorItem(
                 name: agentName,
                 command: agentName,
                 required: false,
-                installed: res.exitCode == 0,
-                version: nil,
-                path: res.exitCode == 0 ? res.stdout : nil,
-                installCommand: installCmd
+                installed: found,
+                version: found ? res.stdout.components(separatedBy: "\n").last : nil,
+                path: found ? res.stdout.components(separatedBy: "\n").first : nil,
+                details: found ? note : note,
+                installCommand: installCmd,
+                category: "agent"
             ))
         }
         
@@ -227,10 +399,25 @@ public final class WorkspaceEngine: @unchecked Sendable {
     }
     
     // MARK: - Provisioning
+
+/// Structured progress so the UI can render a live card instead of parsing log lines.
+    public enum ProvisionEvent: Sendable {
+        public enum RepoPhase: String, Sendable {
+            case waiting = "Waiting"
+            case mirror = "Fetching mirror"
+            case worktree = "Adding worktree"
+            case indexed = "Ready"
+        }
+        case repoStarted(String)
+        case repoPhase(String, RepoPhase)
+        case indexing
+        case complete(String)   // workspace path
+    }
+    
     public func createWorkspace(
         ticket: String,
         selectedRepoNames: [String],
-        onProgress: @escaping (String) -> Void
+        onProgress: @escaping (ProvisionEvent) -> Void
     ) throws -> String {
         let cleanTicket = ticket.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !cleanTicket.isEmpty else {
@@ -256,62 +443,139 @@ public final class WorkspaceEngine: @unchecked Sendable {
         }
         
         for repo in repoDefs {
-            onProgress("Syncing mirror for \(repo.name)...")
-            let barePath = (cacheRoot as NSString).appendingPathComponent("\(repo.name).git")
-            
-            if !FileManager.default.fileExists(atPath: barePath) {
-                onProgress("Initial mirror clone for \(repo.name)...")
-                let cloneRes = ProcessRunner.run("git clone --mirror \(repo.cloneUrl) \"\(barePath)\"")
-                if cloneRes.exitCode != 0 {
-                    throw NSError(domain: "ws", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to mirror \(repo.name): \(cloneRes.stderr)"])
-                }
-            } else {
-                onProgress("Updating mirror cache for \(repo.name)...")
-                _ = ProcessRunner.run("git --git-dir=\"\(barePath)\" fetch --all --prune")
-            }
-            
-            onProgress("Resolving branch for \(repo.name)...")
-            let targetRepoPath = (wsPath as NSString).appendingPathComponent(repo.name)
-            
-            // Check if branch exists on remote or local
-            let checkRemote = ProcessRunner.run("git --git-dir=\"\(barePath)\" branch -r --list \"origin/*\(cleanTicket)*\"")
-            let checkLocal = ProcessRunner.run("git --git-dir=\"\(barePath)\" branch --list \"*\(cleanTicket)*\"")
-            
-            var branchToUse = cleanTicket
-            var addCommand = ""
-            
-            if let matchedRemote = checkRemote.stdout.split(separator: "\n").first?.trimmingCharacters(in: .whitespaces) {
-                // e.g. origin/FINX-1234 or origin/feat/FINX-1234
-                let branchName = matchedRemote.replacingOccurrences(of: "origin/", with: "")
-                branchToUse = branchName
-                addCommand = "git --git-dir=\"\(barePath)\" worktree add \"\(targetRepoPath)\" \"\(branchName)\""
-            } else if let matchedLocal = checkLocal.stdout.split(separator: "\n").first?.trimmingCharacters(in: .whitespaces) {
-                branchToUse = matchedLocal
-                addCommand = "git --git-dir=\"\(barePath)\" worktree add \"\(targetRepoPath)\" \"\(matchedLocal)\""
-            } else {
-                // Brand new branch from origin/main (or defaultBranch)
-                let baseBranch = repo.defaultBranch
-                addCommand = "git --git-dir=\"\(barePath)\" worktree add -b \"\(cleanTicket)\" \"\(targetRepoPath)\" \"origin/\(baseBranch)\""
-            }
-            
-            onProgress("Adding worktree for \(repo.name) [branch: \(branchToUse)]...")
-            let wtRes = ProcessRunner.run(addCommand)
-            if wtRes.exitCode != 0 {
-                throw NSError(domain: "ws", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed worktree for \(repo.name): \(wtRes.stderr)"])
-            }
-            
-            // Auto install post-commit hook for incremental index
-            installGitHook(at: targetRepoPath)
+            onProgress(.repoStarted(repo.name))
+            try provision(repo: repo, ticket: cleanTicket, into: wsPath, onProgress: onProgress)
         }
         
-        // Write workspace.md context file
-        onProgress("Writing workspace context summary...")
+        writeContextFile(ticket: cleanTicket, repos: repoDefs.map { $0.name }, wsPath: wsPath)
+        registerMcpClients(workspacePath: wsPath)
+        
+        onProgress(.indexing)
+        _ = reindexWorkspace(workspacePath: wsPath)
+        
+        onProgress(.complete(wsPath))
+        return wsPath
+    }
+    
+    // MARK: - Add Repos to Existing Workspace
+    
+    /// Adds repos to a live workspace. Same code path as creation so branch
+    /// resolution, hooks and mirrors behave identically. Present repos are skipped.
+    public func addRepos(
+        toWorkspace workspaceName: String,
+        repoNames: [String],
+        onProgress: @escaping (ProvisionEvent) -> Void
+    ) throws {
+        let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
+        let wsPath = (wsRoot as NSString).appendingPathComponent(workspaceName)
+        guard FileManager.default.fileExists(atPath: wsPath) else {
+            throw NSError(domain: "ws", code: 8, userInfo: [NSLocalizedDescriptionKey: "Workspace not found: \(workspaceName)"])
+        }
+        
+        let repoDefs = config.repos.filter { repoNames.contains($0.name) }
+        guard !repoDefs.isEmpty else {
+            throw NSError(domain: "ws", code: 3, userInfo: [NSLocalizedDescriptionKey: "No valid repositories selected."])
+        }
+        
+        var added: [String] = []
+        for repo in repoDefs {
+            let target = (wsPath as NSString).appendingPathComponent(repo.name)
+            if FileManager.default.fileExists(atPath: target) {
+                onProgress(.repoPhase(repo.name, .indexed))
+                continue
+            }
+            onProgress(.repoStarted(repo.name))
+            try provision(repo: repo, ticket: workspaceName, into: wsPath, onProgress: onProgress)
+            added.append(repo.name)
+        }
+        
+        guard !added.isEmpty else {
+            onProgress(.complete(wsPath))
+            return
+        }
+        
+        // Rewrite the context file so it lists the full current repo set.
+        let present = (try? FileManager.default.contentsOfDirectory(atPath: wsPath))?
+            .filter { sub in
+                FileManager.default.fileExists(atPath: (wsPath as NSString).appendingPathComponent("\(sub)/.git"))
+            } ?? added
+        writeContextFile(ticket: workspaceName, repos: present.sorted(), wsPath: wsPath)
+        registerMcpClients(workspacePath: wsPath)
+        
+        onProgress(.indexing)
+        _ = reindexWorkspace(workspacePath: wsPath)
+        onProgress(.complete(wsPath))
+    }
+    
+    // MARK: - Shared per-repo provisioning
+    
+    /// Mirror-sync + worktree-add + hook install for ONE repo. Shared by create and add.
+    private func provision(
+        repo: RepoDefinition,
+        ticket: String,
+        into wsPath: String,
+        onProgress: (ProvisionEvent) -> Void
+    ) throws {
+        let cacheRoot = (config.cacheDirectory as NSString).expandingTildeInPath
+        try FileManager.default.createDirectory(atPath: cacheRoot, withIntermediateDirectories: true)
+        let barePath = (cacheRoot as NSString).appendingPathComponent("\(repo.name).git")
+        
+        if !FileManager.default.fileExists(atPath: barePath) {
+            onProgress(.repoPhase(repo.name, .mirror))
+            let cloneRes = ProcessRunner.run("git clone --mirror \(repo.cloneUrl) \"\(barePath)\"")
+            if cloneRes.exitCode != 0 {
+                throw NSError(domain: "ws", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to mirror \(repo.name): \(cloneRes.stderr)"])
+            }
+        } else {
+            onProgress(.repoPhase(repo.name, .mirror))
+            _ = ProcessRunner.run("git --git-dir=\"\(barePath)\" fetch --all --prune", timeout: 120)
+        }
+        
+        onProgress(.repoPhase(repo.name, .worktree))
+        let targetRepoPath = (wsPath as NSString).appendingPathComponent(repo.name)
+        
+        // A --mirror clone stores every branch as refs/heads/*, NOT refs/remotes/origin/*.
+        // ponytail: query refs/heads and branch off the local name. Using origin/* here
+        // fails with "invalid reference" on every fresh workspace.
+        let existing = ProcessRunner.run("git --git-dir=\"\(barePath)\" branch --list \"*\(ticket)*\"")
+        let candidates = existing.stdout
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        
+        var branchToUse = ticket
+        var addCommand = ""
+        
+        if let matched = candidates.first {
+            // Reuse an existing branch (exact ticket name wins over prefix matches).
+            let chosen = candidates.first { $0 == ticket } ?? matched
+            branchToUse = chosen
+            addCommand = "git --git-dir=\"\(barePath)\" worktree add \"\(targetRepoPath)\" \"\(chosen)\""
+        } else {
+            // Brand new branch off the repo's default branch.
+            let base = repo.defaultBranch
+            let baseCheck = ProcessRunner.run("git --git-dir=\"\(barePath)\" rev-parse --verify --quiet \"\(base)\"")
+            let startPoint = baseCheck.exitCode == 0 ? base : "HEAD"
+            addCommand = "git --git-dir=\"\(barePath)\" worktree add -b \"\(ticket)\" \"\(targetRepoPath)\" \"\(startPoint)\""
+        }
+        
+
+        let wtRes = ProcessRunner.run(addCommand, timeout: 180)
+        if wtRes.exitCode != 0 {
+            throw NSError(domain: "ws", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed worktree for \(repo.name): \(wtRes.stderr)"])
+        }
+        
+        installGitHook(at: targetRepoPath)
+        onProgress(.repoPhase(repo.name, .indexed))
+    }
+    
+    private func writeContextFile(ticket: String, repos: [String], wsPath: String) {
         let contextMd = """
-        # Workspace: \(cleanTicket)
+        # Workspace: \(ticket)
         Provisioned: \(Date())
         
         ## Repositories
-        \(repoDefs.map { "- **\($0.name)** (worktree)" }.joined(separator: "\n"))
+        \(repos.map { "- **\($0)** (worktree)" }.joined(separator: "\n"))
         
         ## AI Agent Guidelines
         - Cross-repo symbols and definitions indexed via `codebase-memory-mcp`.
@@ -319,17 +583,6 @@ public final class WorkspaceEngine: @unchecked Sendable {
         - Run tests and linters natively inside respective subdirectories.
         """
         try? contextMd.write(toFile: (wsPath as NSString).appendingPathComponent("workspace.md"), atomically: true, encoding: .utf8)
-        
-        // Auto register MCP configs
-        onProgress("Registering MCP config for AI agents...")
-        registerMcpClients(workspacePath: wsPath)
-        
-        // Auto index via codebase-memory-mcp
-        onProgress("Building semantic code graph (codebase-memory-mcp)...")
-        _ = reindexWorkspace(workspacePath: wsPath)
-        
-        onProgress("Workspace \(cleanTicket) ready.")
-        return wsPath
     }
     
     public func reindexWorkspace(workspacePath: String) -> (success: Bool, message: String) {

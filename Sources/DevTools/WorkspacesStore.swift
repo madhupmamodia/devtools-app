@@ -11,13 +11,111 @@ public final class WorkspacesStore: ObservableObject {
     
     @Published public var selectedTab: WSTab = .list
     @Published public var isRunningDoctor: Bool = false
+    @Published public var installingItemID: String?
     @Published public var isProvisioning: Bool = false
     @Published public var statusMessage: String?
     @Published public var statusError: String?
+    /// Which tab the current message belongs to. Stops "created!" banners leaking
+    /// across Workspaces / New / Doctor.
+    @Published public var statusOwner: WSTab?
+    private var statusClearTask: Task<Void, Never>?
+    
+    /// Sets a transient message and auto-clears it. Errors stay until replaced.
+    public func flash(_ message: String, owner: WSTab, after seconds: Double = 6) {
+        statusOwner = owner
+        statusMessage = message
+        statusError = nil
+        statusClearTask?.cancel()
+        statusClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard self?.statusMessage == message else { return }
+                self?.statusMessage = nil
+            }
+        }
+    }
+    
+    public func fail(_ message: String, owner: WSTab) {
+        statusClearTask?.cancel()
+        statusOwner = owner
+        statusError = message
+        statusMessage = nil
+    }
     
     // Creation Sheet State
     @Published public var ticketInput: String = ""
     @Published public var selectedRepoNames: Set<String> = []
+    @Published public var repoSearchText: String = ""
+    @Published public var isSyncingRepos: Bool = false
+    @Published public var repoUsage: WorkspaceEngine.RepoUsage?
+    @Published public var isSyncingUsage: Bool = false
+    
+    public func usageScore(for repo: String) -> Int {
+        guard let usage = repoUsage else { return 0 }
+        return engine.usageScore(for: repo, usage: usage)
+    }
+    
+    public var hasUsage: Bool { repoUsage != nil }
+    
+    /// Repos matching the search box, always ranked by the signed-in user's own
+    /// GitHub activity. No toggle: alphabetical order of 379 repos is never the
+    /// useful default.
+    public var visibleRepos: [RepoDefinition] {
+        let q = repoSearchText.trimmingCharacters(in: .whitespaces).lowercased()
+        let list = q.isEmpty ? configuredRepos : configuredRepos.filter { $0.name.lowercased().contains(q) }
+        return list.sorted { a, b in
+            let sa = usageScore(for: a.name), sb = usageScore(for: b.name)
+            if sa != sb { return sa > sb }
+            return a.name < b.name
+        }
+    }
+    
+    /// Fetches ranking in the background when the cache is missing or older than 7 days.
+    /// ponytail: never blocks the UI on this — it costs ~12s of GitHub paging.
+    public func syncUsageIfStale(maxAgeDays: Int = 7) {
+        guard !isSyncingUsage else { return }
+        if let cached = repoUsage,
+           Date().timeIntervalSince(cached.fetchedAt) < Double(maxAgeDays) * 86400 {
+            return
+        }
+        isSyncingUsage = true
+        Task.detached { [engine = self.engine] in
+            let usage = engine.syncRepoUsage()
+            await MainActor.run {
+                self.repoUsage = usage
+                self.isSyncingUsage = false
+                if usage == nil {
+                    self.fail("Could not read GitHub activity. Check 'gh auth status'.", owner: .create)
+                }
+            }
+        }
+    }
+    
+    public func toggleAllRepos(_ on: Bool) {
+        selectedRepoNames = on ? Set(visibleRepos.map { $0.name }) : []
+    }
+    
+    public var allVisibleSelected: Bool {
+        let vis = visibleRepos
+        return !vis.isEmpty && vis.allSatisfy { selectedRepoNames.contains($0.name) }
+    }
+    
+    public func syncRepos() {
+        isSyncingRepos = true
+        Task.detached { [engine = self.engine] in
+            let count = engine.syncReposFromGitHub()
+            await MainActor.run {
+                self.configuredRepos = engine.config.repos
+                self.isSyncingRepos = false
+                if count > 0 {
+                    self.flash("Synced \(count) repos from \(engine.config.defaultOrg).", owner: .create)
+                } else {
+                    self.fail("Sync failed. Check 'gh auth status'.", owner: .create)
+                }
+            }
+        }
+    }
     
     public enum WSTab: String, CaseIterable, Identifiable {
         case list = "Workspaces"
@@ -29,20 +127,124 @@ public final class WorkspacesStore: ObservableObject {
     private let engine = WorkspaceEngine.shared
     
     public init() {
-        refreshAll()
+        self.configuredRepos = engine.config.repos
+        // ponytail: don't preselect 379 repos. Start empty, user opts in.
+        self.selectedRepoNames = []
+        self.repoUsage = engine.loadRepoUsage()
     }
     
+    /// Kicks off a GitHub org scan on first load if the cache is empty.
+    public func syncReposIfEmpty() {
+        guard configuredRepos.isEmpty, !isSyncingRepos else { return }
+        syncRepos()
+    }
+    
+    // ponytail: workspaces load fast, doctor shells out ~14x so it runs in background.
+    // Never blocks the tab switch.
     public func refreshAll() {
         self.workspaces = engine.listWorkspaces()
-        self.doctorItems = engine.checkDoctor()
         self.configuredRepos = engine.config.repos
-        if selectedRepoNames.isEmpty {
-            selectedRepoNames = Set(configuredRepos.map { $0.name })
+        if repoUsage == nil { repoUsage = engine.loadRepoUsage() }
+        syncReposIfEmpty()
+        syncUsageIfStale()
+        Task.detached { [engine = self.engine] in
+            let items = engine.checkDoctor()
+            await MainActor.run { self.doctorItems = items }
+        }
+    }
+    
+    /// Installs a single tool. ponytail: users pick what they want — never blanket-install
+    /// every agent just because one is missing.
+    // Sheet state for adding repos to a live workspace
+    @Published public var addRepoTarget: WorkspaceInfo?
+    @Published public var addRepoSelection: Set<String> = []
+    @Published public var addRepoSearch: String = ""
+    @Published public var isAddingRepos: Bool = false
+    
+    /// Repos not already present in the target workspace, ranked like the create form.
+    public var addRepoCandidates: [RepoDefinition] {
+        guard let target = addRepoTarget else { return [] }
+        let existing = Set(target.repos)
+        let q = addRepoSearch.trimmingCharacters(in: .whitespaces).lowercased()
+        return configuredRepos
+            .filter { !existing.contains($0.name) }
+            .filter { q.isEmpty || $0.name.lowercased().contains(q) }
+            .sorted { a, b in
+                let sa = usageScore(for: a.name), sb = usageScore(for: b.name)
+                if sa != sb { return sa > sb }
+                return a.name < b.name
+            }
+    }
+    
+    public func beginAddRepos(to ws: WorkspaceInfo) {
+        addRepoTarget = ws
+        addRepoSelection = []
+        addRepoSearch = ""
+    }
+    
+    public func cancelAddRepos() {
+        addRepoTarget = nil
+        addRepoSelection = []
+        isAddingRepos = false
+    }
+    
+    public func commitAddRepos() {
+        guard let target = addRepoTarget, !addRepoSelection.isEmpty else { return }
+        isAddingRepos = true
+        statusOwner = .list
+        statusError = nil
+        let name = target.name
+        let repos = Array(addRepoSelection)
+        activeProvision = ActiveProvision(
+            ticket: name,
+            repos: repos.map { RepoProgress(repo: $0, phase: .waiting) },
+            indexing: false, finished: false, failed: nil
+        )
+        Task.detached { [engine = self.engine] in
+            do {
+                try engine.addRepos(toWorkspace: name, repoNames: repos) { ev in
+                    Task { @MainActor in self.apply(ev) }
+                }
+                await MainActor.run {
+                    self.isAddingRepos = false
+                    self.addRepoTarget = nil
+                    self.addRepoSelection = []
+                    self.refreshAll()
+                    self.flash("Added \\(repos.count) repo(s) to \\(name).", owner: .list)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isAddingRepos = false
+                    self.fail(error.localizedDescription, owner: .list)
+                }
+            }
+        }
+    }
+    
+    public func install(_ item: DoctorItem) {
+        guard installingItemID == nil, let cmd = item.installCommand else { return }
+        installingItemID = item.id
+        statusOwner = .doctor
+        statusError = nil
+        statusMessage = "Installing \(item.name)…"
+        let name = item.name
+        Task.detached { [engine = self.engine] in
+            let ok = engine.fixDoctor(item: item)
+            await MainActor.run {
+                self.installingItemID = nil
+                self.doctorItems = engine.checkDoctor()
+                if ok {
+                    self.flash("\(name) installed.", owner: .doctor)
+                } else {
+                    self.fail("Install failed for \(name). Command: \(cmd)", owner: .doctor)
+                }
+            }
         }
     }
     
     public func runDoctorFixes() {
         isRunningDoctor = true
+        statusOwner = .doctor
         statusMessage = "Installing missing prerequisites..."
         Task.detached { [engine = self.engine] in
             let items = engine.checkDoctor()
@@ -52,80 +254,221 @@ public final class WorkspacesStore: ObservableObject {
             await MainActor.run {
                 self.doctorItems = engine.checkDoctor()
                 self.isRunningDoctor = false
-                self.statusMessage = "Doctor verification finished."
+                self.flash("Doctor verification finished.", owner: .doctor)
             }
         }
+    }
+    
+    /// Live state for the workspace currently being provisioned. Rendered as a card in the
+    /// Workspaces list so the user watches the workspace build, not a log scroll by.
+    public struct RepoProgress: Identifiable {
+        public var id: String { repo }
+        public var repo: String
+        public var phase: WorkspaceEngine.ProvisionEvent.RepoPhase
+    }
+    
+    public struct ActiveProvision: Identifiable {
+        public var id: String { ticket }
+        public var ticket: String
+        public var repos: [RepoProgress]
+        public var indexing: Bool
+        public var finished: Bool
+        public var failed: String?
+        
+        var headline: String {
+            if let failed { return "Failed" }
+            if finished { return "Ready" }
+            if indexing { return "Building code graph…" }
+            return "Creating…"
+        }
+    }
+    
+    @Published public var activeProvision: ActiveProvision?
+    /// Non-nil means "a prune is awaiting confirmation". Nothing deletes without it.
+    @Published public var pruneTarget: WorkspaceInfo?
+    /// Must be true before a dirty workspace can be force-deleted.
+    @Published public var pruneAckDestroy: Bool = false
+    private var provisionClearTask: Task<Void, Never>?
+
+    /// Repos with uncommitted changes in the pending prune. Empty = safe to delete.
+    public func dirtyRepos(in ws: WorkspaceInfo) -> [(repo: String, count: Int)] {
+        ws.repos
+            .map { ($0, ws.dirtyCounts[$0] ?? 0) }
+            .filter { $0.1 > 0 }
+            .sorted { $0.1 > $1.1 }
+    }
+
+    /// Stage a prune for confirmation. Never deletes on its own.
+    public func requestPrune(_ ws: WorkspaceInfo) {
+        pruneTarget = ws
+        pruneAckDestroy = false
+    }
+
+    public func cancelPrune() {
+        pruneTarget = nil
+        pruneAckDestroy = false
+    }
+
+    /// Actually delete. `force` is required when any repo has uncommitted changes.
+    public func confirmPrune(force: Bool) {
+        guard let ws = pruneTarget else { return }
+        pruneTarget = nil
+        pruneAckDestroy = false
+        do {
+            try engine.pruneWorkspace(name: ws.name, force: force)
+            flash("Pruned \(ws.name).", owner: .list)
+        } catch {
+            fail(error.localizedDescription, owner: .list)
+        }
+        refreshAll()
     }
     
     public func createWorkspace() {
         guard !ticketInput.trimmingCharacters(in: .whitespaces).isEmpty else {
-            statusError = "Ticket ID cannot be empty."
+            fail("Ticket ID cannot be empty.", owner: .create)
             return
         }
         guard !selectedRepoNames.isEmpty else {
-            statusError = "Select at least one repo."
+            fail("Select at least one repo.", owner: .create)
             return
         }
         
-        isProvisioning = true
-        statusError = nil
         let ticket = ticketInput.trimmingCharacters(in: .whitespaces).uppercased()
         let repos = Array(selectedRepoNames)
         
+        isProvisioning = true
+        statusError = nil
+        selectedTab = .list
+        activeProvision = ActiveProvision(
+            ticket: ticket,
+            repos: repos.map { RepoProgress(repo: $0, phase: .waiting) },
+            indexing: false,
+            finished: false,
+            failed: nil
+        )
+        resetCreateForm()
+        
         Task.detached { [engine = self.engine] in
             do {
-                _ = try engine.createWorkspace(ticket: ticket, selectedRepoNames: repos) { progress in
-                    Task { @MainActor in
-                        self.statusMessage = progress
-                    }
+                _ = try engine.createWorkspace(ticket: ticket, selectedRepoNames: repos) { ev in
+                    Task { @MainActor in self.apply(ev) }
                 }
                 await MainActor.run {
                     self.isProvisioning = false
-                    self.ticketInput = ""
-                    self.statusMessage = "Workspace \(ticket) created!"
                     self.refreshAll()
-                    self.selectedTab = .list
                 }
             } catch {
                 await MainActor.run {
                     self.isProvisioning = false
-                    self.statusError = error.localizedDescription
+                    self.activeProvision?.failed = error.localizedDescription
+                    self.refreshAll()
                 }
             }
         }
     }
     
+    private func apply(_ ev: WorkspaceEngine.ProvisionEvent) {
+        guard var ap = activeProvision else { return }
+        switch ev {
+        case .repoStarted(let r):
+            if let i = ap.repos.firstIndex(where: { $0.repo == r }) { ap.repos[i].phase = .mirror }
+        case .repoPhase(let r, let phase):
+            if let i = ap.repos.firstIndex(where: { $0.repo == r }) { ap.repos[i].phase = phase }
+        case .indexing:
+            ap.indexing = true
+        case .complete:
+            ap.indexing = false
+            ap.finished = true
+            ap.repos = ap.repos.map { RepoProgress(repo: $0.repo, phase: .indexed) }
+            // Hand over to the real workspace card once the user has seen "Ready".
+            provisionClearTask?.cancel()
+            provisionClearTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    if self?.activeProvision?.finished == true { self?.activeProvision = nil }
+                }
+            }
+        }
+        activeProvision = ap
+    }
+    
+    public func dismissActiveProvision() {
+        provisionClearTask?.cancel()
+        activeProvision = nil
+    }
+    
+    /// Fresh form for the next ticket. Keeps repo list + ranking cache intact.
+    public func resetCreateForm() {
+        ticketInput = ""
+        selectedRepoNames = []
+        repoSearchText = ""
+    }
+    
     public func reindex(workspace: WorkspaceInfo) {
-        statusMessage = "Re-indexing \(workspace.name)..."
+        statusOwner = .list
+        statusMessage = "Re-indexing \(workspace.name)…"
         let path = workspace.path
         Task.detached { [engine = self.engine] in
             let res = engine.reindexWorkspace(workspacePath: path)
             await MainActor.run {
-                self.statusMessage = res.message
+                self.flash(res.message, owner: .list, after: 8)
                 self.refreshAll()
             }
         }
     }
     
-    public func prune(workspace: WorkspaceInfo, force: Bool = false) {
-        do {
-            try engine.pruneWorkspace(name: workspace.name, force: force)
-            statusMessage = "Pruned \(workspace.name)."
-            refreshAll()
-        } catch {
-            statusError = error.localizedDescription
+    public func openInCursor(workspace: WorkspaceInfo) {
+        // shell-escaped: workspace paths can contain spaces
+        _ = ProcessRunner.run("cursor \(shellQuote(workspace.path))")
+    }
+    
+    /// iTerm2 when installed, otherwise falls back to Terminal.app. Identified at call
+    /// time so a later `brew install --cask iterm2` is picked up without a restart.
+    public func openInITerm(workspace: WorkspaceInfo) {
+        let hasITerm = FileManager.default.fileExists(atPath: "/Applications/iTerm.app")
+        if hasITerm {
+            _ = ProcessRunner.run("open -a iTerm \(shellQuote(workspace.path))")
+        } else {
+            _ = ProcessRunner.run("open -a Terminal \(shellQuote(workspace.path))")
         }
     }
     
-    public func openInCursor(workspace: WorkspaceInfo) {
-        _ = ProcessRunner.run("cursor \"\(workspace.path)\"")
+    public func openInTerminal(workspace: WorkspaceInfo) {
+        _ = ProcessRunner.run("open -a Terminal \(shellQuote(workspace.path))")
     }
     
-    public func openInTerminal(workspace: WorkspaceInfo) {
-        _ = ProcessRunner.run("open -a Terminal \"\(workspace.path)\"")
+    public var preferredTerminalName: String {
+        FileManager.default.fileExists(atPath: "/Applications/iTerm.app") ? "iTerm2" : "Terminal"
+    }
+    
+    public var hasOpenCodeDesktop: Bool {
+        FileManager.default.fileExists(atPath: "/Applications/OpenCode.app")
+    }
+    
+    public var hasCursor: Bool {
+        FileManager.default.fileExists(atPath: "/Applications/Cursor.app")
     }
     
     public func openInOpenCode(workspace: WorkspaceInfo) {
-        _ = ProcessRunner.run("open -a Terminal \"\(workspace.path)\"")
+        let q = shellQuote(workspace.path)
+        if FileManager.default.fileExists(atPath: "/Applications/OpenCode.app") {
+            _ = ProcessRunner.run("open -a OpenCode \(q)")
+        } else {
+            // Desktop app missing: fall back to the TUI in the user's preferred terminal.
+            let term = FileManager.default.fileExists(atPath: "/Applications/iTerm.app") ? "iTerm" : "Terminal"
+            _ = ProcessRunner.run("open -a \(term) \(q) --args \(q)")
+        }
+    }
+    
+    public func openInClaude(workspace: WorkspaceInfo) {
+        let q = shellQuote(workspace.path)
+        let term = FileManager.default.fileExists(atPath: "/Applications/iTerm.app") ? "iTerm" : "Terminal"
+        _ = ProcessRunner.run("open -a \(term) \(q)")
+    }
+    
+    /// Single-quote for POSIX shell. Ticket names are validated but repo/paths are not.
+    private func shellQuote(_ s: String) -> String {
+        "'\(s.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 }

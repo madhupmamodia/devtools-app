@@ -55,8 +55,8 @@ struct SetupView: View {
                     .keyboardShortcut("q")
             }
         }
-        .padding(14)
-        .frame(width: 320)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
         .onAppear { keyFocused = true }
     }
 }
@@ -107,24 +107,24 @@ struct StatsView: View {
                     .keyboardShortcut("q")
             }
         }
-        .padding(14)
-        .frame(width: 320)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
     }
 
     private var overviewTab: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 5) {
             row("Today",    String(format: "$%.2f", store.todaySpend))
             row(rangeTitle, String(format: "$%.2f", store.rangeSpend))
             row("Tokens",   formatTokens(store.rangeTokens), secondary: true)
             row("Requests", "\(store.rangeRequests)", secondary: true)
 
             if store.hasBudget {
-                Divider().padding(.vertical, 2)
+                Divider().padding(.vertical, 4)
                 budgetSection
             }
 
             if !store.topModelsToday.isEmpty {
-                Divider().padding(.vertical, 2)
+                Divider().padding(.vertical, 4)
                 Text("Top models today")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -135,7 +135,7 @@ struct StatsView: View {
             }
 
             if let last = store.lastFetch {
-                Divider().padding(.vertical, 2)
+                Divider().padding(.vertical, 4)
                 Text("Updated \(last.formatted(date: .omitted, time: .standard))")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
@@ -655,7 +655,7 @@ struct CustomRangeView: View {
                     .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(14)
-        .frame(width: 280)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
     }
 }

@@ -15,16 +15,8 @@ struct DevToolsApp: App {
     @StateObject private var wsStore = WorkspacesStore()
 
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra("DevTools", systemImage: "hammer.fill") {
             MainContainerView(usageStore: usageStore, wsStore: wsStore)
-        } label: {
-            HStack(spacing: 3) {
-                Image(systemName: "hammer.fill")
-                if usageStore.todaySpend > 0 {
-                    Text(String(format: "$%.2f", usageStore.todaySpend))
-                        .font(.caption2)
-                }
-            }
         }
         .menuBarExtraStyle(.window)
     }
@@ -63,6 +55,7 @@ struct MainContainerView: View {
             // Content Body
             if activeSection == .workspaces {
                 WorkspacesRootView(store: wsStore)
+                    .frame(height: 560)
             } else {
                 if usageStore.needsSetup {
                     SetupView(store: usageStore)
@@ -73,6 +66,6 @@ struct MainContainerView: View {
                 }
             }
         }
-        .frame(width: 360)
+        .frame(width: activeSection == .workspaces ? 440 : 360)
     }
 }
