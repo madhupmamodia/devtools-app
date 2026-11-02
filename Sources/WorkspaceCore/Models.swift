@@ -3,29 +3,23 @@ import Foundation
 public struct DoctorItem: Codable, Identifiable, Sendable {
     public var id: String { name }
     public let name: String
-    public let command: String
     public let required: Bool
     public let installed: Bool
     public let version: String?
-    public let path: String?
     public let details: String?
     public let installCommand: String?
     /// "tool" for hard dependencies, "agent" for optional AI agents the user picks.
     public let category: String
     
-    public init(name: String, command: String, required: Bool, installed: Bool, version: String? = nil, path: String? = nil, details: String? = nil, installCommand: String? = nil, category: String = "tool") {
+    public init(name: String, required: Bool, installed: Bool, version: String? = nil, details: String? = nil, installCommand: String? = nil, category: String = "tool") {
         self.name = name
-        self.command = command
         self.required = required
         self.installed = installed
         self.version = version
-        self.path = path
         self.details = details
         self.installCommand = installCommand
         self.category = category
     }
-    
-    public static func == (lhs: DoctorItem, rhs: DoctorItem) -> Bool { lhs.id == rhs.id }
 }
 
 public struct RepoDefinition: Codable, Identifiable {
@@ -44,7 +38,6 @@ public struct RepoDefinition: Codable, Identifiable {
 public struct WorkspaceInfo: Codable, Identifiable {
     public var id: String { name }
     public let name: String
-    public let ticket: String
     public let path: String
     public let repos: [String]
     public let branches: [String: String]
@@ -53,9 +46,8 @@ public struct WorkspaceInfo: Codable, Identifiable {
     public let isStale: Bool
     public let lastModified: Date
     
-    public init(name: String, ticket: String, path: String, repos: [String], branches: [String: String], dirtyCounts: [String: Int], hasMcpIndex: Bool, isStale: Bool, lastModified: Date) {
+    public init(name: String, path: String, repos: [String], branches: [String: String], dirtyCounts: [String: Int], hasMcpIndex: Bool, isStale: Bool, lastModified: Date) {
         self.name = name
-        self.ticket = ticket
         self.path = path
         self.repos = repos
         self.branches = branches
@@ -86,13 +78,68 @@ public struct WSConfig: Codable {
 }
 
 public enum ProcessRunner {
+    /// Node major version the app prefers when several are installed via nvm.
+    /// ponytail: one constant, not a settings screen. Bump it when the team moves on.
+    public static let preferredNodeMajor = 22
+    
+    /// Every nvm-installed node bin dir, best first: preferred major version (highest
+    /// patch) first, then the rest newest-first.
+    ///
+    /// GUI apps never source .zshrc, so nvm is not initialised and `node` / npm globals
+    /// are invisible. That is why the Doctor reported node and codebase-memory-mcp as
+    /// missing even though both are installed. Keep the other majors on PATH as a
+    /// fallback so globals installed under a different version stay reachable.
+    public static func nvmBinPaths() -> [String] {
+        let versionsDir = (NSHomeDirectory() as NSString)
+            .appendingPathComponent(".nvm/versions/node")
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: versionsDir) else {
+            return []
+        }
+        
+        struct V { let major: Int; let minor: Int; let patch: Int; let dir: String }
+        let parsed: [V] = entries.compactMap { name in
+            guard name.hasPrefix("v") else { return nil }
+            let parts = name.dropFirst().split(separator: ".", omittingEmptySubsequences: false)
+            guard parts.count >= 3,
+                  let major = Int(parts[0]), let minor = Int(parts[1]), let patch = Int(parts[2])
+            else { return nil }
+            let bin = (versionsDir as NSString).appendingPathComponent("\(name)/bin")
+            guard FileManager.default.fileExists(atPath: bin) else { return nil }
+            return V(major: major, minor: minor, patch: patch, dir: bin)
+        }
+        
+        let preferred = parsed.filter { $0.major == preferredNodeMajor }
+            .sorted { ($0.minor, $0.patch) > ($1.minor, $1.patch) }
+        let others = parsed.filter { $0.major != preferredNodeMajor }
+            .sorted { ($0.major, $0.minor, $0.patch) > ($1.major, $1.minor, $1.patch) }
+        return (preferred + others).map { $0.dir }
+    }
+    
+    /// Well-known directories where AI agent CLIs install themselves. GUI apps do not
+    /// source .zshrc, so these are invisible to the app unless added explicitly.
+    /// Filtered to dirs that exist so new joiners do not get phantom PATH entries.
+    public static func agentBinPaths() -> [String] {
+        let home = NSHomeDirectory()
+        let candidates = [
+            "\(home)/.opencode/bin",
+            "\(home)/.local/bin",
+            "\(home)/.claude/local",
+            "\(home)/.claude/bin",
+            "\(home)/.codex/bin",
+            "\(home)/.gemini/bin",
+            "\(home)/.aider/bin",
+            "\(home)/.antigravity/bin",
+            "\(home)/.factory/bin"
+        ]
+        return candidates.filter { FileManager.default.fileExists(atPath: $0) }
+    }
+    
     // ponytail: login shell (-l) costs 200-400ms per spawn loading zprofile. PATH is
     // injected explicitly below, so skip it. Add -l back if a command needs user profile env.
     private static let enrichedPath: String = {
         var paths = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "\(NSHomeDirectory())/.local/bin"]
-        if let nvm = ProcessInfo.processInfo.environment["NVM_BIN"] {
-            paths.append(nvm)
-        }
+        paths.append(contentsOf: agentBinPaths())
+        paths.append(contentsOf: nvmBinPaths())
         let base = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         return (paths + base.components(separatedBy: ":")).joined(separator: ":")
     }()

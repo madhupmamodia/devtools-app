@@ -95,6 +95,10 @@ struct StatsView: View {
                 modelsTab
             }
 
+            // Pushes the action bar to the bottom edge so it sits at the same
+            // height on every sub-tab, matching the Workspaces pane.
+            Spacer(minLength: 0)
+
             Divider().padding(.vertical, 2)
             HStack {
                 Button(store.isLoading ? "Refreshing…" : "Refresh") {
@@ -204,7 +208,7 @@ struct StatsView: View {
             .foregroundStyle(.tertiary)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 1) {
+                LazyVStack(alignment: .leading, spacing: 1) {
                     ForEach(filteredModels, id: \.id) { m in
                         modelRow(m, inUse: usedModelIds.contains(m.id))
                     }
@@ -215,8 +219,11 @@ struct StatsView: View {
                             .padding(.vertical, 4)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxHeight: 400)
+            // Fill the pane like the create-workspace repo list does. A hardcoded
+            // maxHeight silently collapses when the parent window has no declared height.
+            .frame(maxHeight: .infinity)
         }
     }
 
@@ -356,6 +363,8 @@ struct StatsView: View {
             }
         }
         .font(.caption2)
+        // Match the repo list's compact row rhythm so ~20 models fit the pane.
+        .padding(.vertical, 1)
     }
 
     private func formatCost(_ v: Double?) -> String {

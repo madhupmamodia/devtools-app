@@ -57,15 +57,24 @@ struct MainContainerView: View {
                 WorkspacesRootView(store: wsStore)
                     .frame(height: 560)
             } else {
+                // Only Models needs a tall pane — its list should fill it.
+                // Overview/Insights/Setup size to their own content instead of
+                // leaving a dead gap above the action bar.
+                let paneHeight: CGFloat? = usageStore.activeTab == .models ? 560 : nil
                 if usageStore.needsSetup {
                     SetupView(store: usageStore)
+                        .frame(height: paneHeight)
                 } else if usageStore.showCustomRange {
                     CustomRangeView(store: usageStore)
+                        .frame(height: paneHeight)
                 } else {
                     StatsView(store: usageStore)
+                        .frame(height: paneHeight)
                 }
             }
         }
-        .frame(width: activeSection == .workspaces ? 440 : 360)
+        // One width for every pane. 440 fits long repo names + PR badges and the
+        // 4-column models table. A per-section width makes the window jump on tab switch.
+        .frame(width: 440)
     }
 }

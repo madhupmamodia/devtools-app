@@ -200,6 +200,11 @@ public final class WorkspacesStore: ObservableObject {
             repos: repos.map { RepoProgress(repo: $0, phase: .waiting) },
             indexing: false, finished: false, failed: nil
         )
+        // Close the sheet immediately. The provision card at the top now owns the
+        // progress; leaving the form open duplicates it and blocks the list.
+        addRepoTarget = nil
+        addRepoSelection = []
+        
         Task.detached { [engine = self.engine] in
             do {
                 try engine.addRepos(toWorkspace: name, repoNames: repos) { ev in
@@ -207,14 +212,72 @@ public final class WorkspacesStore: ObservableObject {
                 }
                 await MainActor.run {
                     self.isAddingRepos = false
-                    self.addRepoTarget = nil
-                    self.addRepoSelection = []
                     self.refreshAll()
-                    self.flash("Added \\(repos.count) repo(s) to \\(name).", owner: .list)
+                    self.flash("Added \(repos.count) repo(s) to \(name).", owner: .list)
                 }
             } catch {
                 await MainActor.run {
                     self.isAddingRepos = false
+                    self.refreshAll()
+                    self.fail(error.localizedDescription, owner: .list)
+                }
+            }
+        }
+    }
+    
+    // Sheet state for removing repos from a live workspace
+    @Published public var removeRepoTarget: WorkspaceInfo?
+    @Published public var removeRepoSelection: Set<String> = []
+    @Published public var isRemovingRepos: Bool = false
+    /// Must be true before a repo with uncommitted changes can be discarded.
+    @Published public var removeAckDirty: Bool = false
+    
+    public func beginRemoveRepos(to ws: WorkspaceInfo) {
+        removeRepoTarget = ws
+        removeRepoSelection = []
+        removeAckDirty = false
+    }
+    
+    public func cancelRemoveRepos() {
+        removeRepoTarget = nil
+        removeRepoSelection = []
+        removeAckDirty = false
+    }
+    
+    /// Repos selected for removal that still have uncommitted changes.
+    public var removeDirtyRepos: [(repo: String, count: Int)] {
+        guard let ws = removeRepoTarget else { return [] }
+        return removeRepoSelection
+            .compactMap { name -> (String, Int)? in
+                let n = ws.dirtyCounts[name] ?? 0
+                return n > 0 ? (name, n) : nil
+            }
+            .sorted { $0.1 > $1.1 }
+    }
+    
+    public func commitRemoveRepos() {
+        guard let target = removeRepoTarget, !removeRepoSelection.isEmpty else { return }
+        let name = target.name
+        let repos = Array(removeRepoSelection)
+        let dirty = !removeDirtyRepos.isEmpty
+        if dirty && !removeAckDirty { return }
+        
+        isRemovingRepos = true
+        statusError = nil
+        Task.detached { [engine = self.engine] in
+            do {
+                try engine.removeRepos(fromWorkspace: name, repoNames: repos, force: dirty)
+                await MainActor.run {
+                    self.isRemovingRepos = false
+                    self.removeRepoTarget = nil
+                    self.removeRepoSelection = []
+                    self.removeAckDirty = false
+                    self.refreshAll()
+                    self.flash("Removed \(repos.count) repo(s) from \(name).", owner: .list)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isRemovingRepos = false
                     self.fail(error.localizedDescription, owner: .list)
                 }
             }
@@ -423,48 +486,69 @@ public final class WorkspacesStore: ObservableObject {
         _ = ProcessRunner.run("cursor \(shellQuote(workspace.path))")
     }
     
-    /// iTerm2 when installed, otherwise falls back to Terminal.app. Identified at call
-    /// time so a later `brew install --cask iterm2` is picked up without a restart.
+    private func appExists(_ name: String) -> Bool {
+        FileManager.default.fileExists(atPath: "/Applications/\(name).app")
+    }
+    
+    /// iTerm2 when installed, otherwise Terminal.app. Checked at call time so a later
+    /// `brew install --cask iterm2` is picked up without a restart.
     public func openInITerm(workspace: WorkspaceInfo) {
-        let hasITerm = FileManager.default.fileExists(atPath: "/Applications/iTerm.app")
-        if hasITerm {
-            _ = ProcessRunner.run("open -a iTerm \(shellQuote(workspace.path))")
-        } else {
-            _ = ProcessRunner.run("open -a Terminal \(shellQuote(workspace.path))")
-        }
+        _ = ProcessRunner.run("open -a \(terminalApp) \(shellQuote(workspace.path))")
     }
     
     public func openInTerminal(workspace: WorkspaceInfo) {
         _ = ProcessRunner.run("open -a Terminal \(shellQuote(workspace.path))")
     }
     
-    public var preferredTerminalName: String {
-        FileManager.default.fileExists(atPath: "/Applications/iTerm.app") ? "iTerm2" : "Terminal"
-    }
+    /// Bundle name Launch Services understands. Falls back to Terminal.app.
+    private var terminalApp: String { appExists("iTerm") ? "iTerm" : "Terminal" }
     
-    public var hasOpenCodeDesktop: Bool {
-        FileManager.default.fileExists(atPath: "/Applications/OpenCode.app")
-    }
+    public var preferredTerminalName: String { appExists("iTerm") ? "iTerm2" : "Terminal" }
     
-    public var hasCursor: Bool {
-        FileManager.default.fileExists(atPath: "/Applications/Cursor.app")
-    }
+    public var hasOpenCodeDesktop: Bool { appExists("OpenCode") }
+    
+    public var hasCursor: Bool { appExists("Cursor") }
     
     public func openInOpenCode(workspace: WorkspaceInfo) {
-        let q = shellQuote(workspace.path)
-        if FileManager.default.fileExists(atPath: "/Applications/OpenCode.app") {
-            _ = ProcessRunner.run("open -a OpenCode \(q)")
+        // OpenCode desktop 1.19.3 cannot be driven into a project. Its
+        // opencode://open-project deep link is received by the main process but the
+        // renderer drops it: handleDeepLinks() bails on server.isLocal(), and the
+        // shipped build hardcodes InstallationChannel = "prod", so isLocal() is always
+        // false. Verified: the link logs as received, but projects.touch() never runs.
+        //
+        // ponytail: do not "fix" this by adding a deep link back — it will silently
+        // no-op. Launching the CLI instead registers the directory in the shared
+        // ~/.local/share/opencode DB, so the desktop app then lists the project and
+        // the engineer opens it with one click. Works without quitting their session.
+        openTerminalRunning("opencode", in: workspace)
+    }
+    
+    /// Opens a terminal window at the workspace and runs `command` there.
+    public func openTerminalRunning(_ command: String, in workspace: WorkspaceInfo) {
+        let dir = shellQuote(workspace.path)
+        let line = "cd \(dir) && \(command)"
+        
+        if appExists("iTerm") {
+            // iTerm2 AppleScript: create a window running the command in that dir.
+            let script = """
+            tell application "iTerm"
+              activate
+              set newWindow to (create window with default profile)
+              tell current session of newWindow
+                write text "\(line)"
+              end tell
+            end tell
+            """
+            ProcessRunner.run("osascript -e \(shellQuote(script))")
         } else {
-            // Desktop app missing: fall back to the TUI in the user's preferred terminal.
-            let term = FileManager.default.fileExists(atPath: "/Applications/iTerm.app") ? "iTerm" : "Terminal"
-            _ = ProcessRunner.run("open -a \(term) \(q) --args \(q)")
+            ProcessRunner.run("osascript -e \(shellQuote("tell application \"Terminal\" to do script \(shellQuote(line))"))")
         }
     }
     
-    public func openInClaude(workspace: WorkspaceInfo) {
-        let q = shellQuote(workspace.path)
-        let term = FileManager.default.fileExists(atPath: "/Applications/iTerm.app") ? "iTerm" : "Terminal"
-        _ = ProcessRunner.run("open -a \(term) \(q)")
+    /// Fallback that always works: show the folder so the engineer can use
+    /// OpenCode desktop's File > Open Folder.
+    public func revealInFinder(workspace: WorkspaceInfo) {
+        ProcessRunner.run("open \(shellQuote(workspace.path))")
     }
     
     /// Single-quote for POSIX shell. Ticket names are validated but repo/paths are not.

@@ -55,21 +55,54 @@ xattr -cr "$APP_DIR"
 
 echo "Built $APP_DIR and CLI binary .build/release/ws"
 
+# User data that MUST survive every install/update. Nothing in this script may ever
+# delete these paths. All live outside the .app bundle by design.
+#
+#   ~/workspaces/               task worktrees
+#   ~/.cache/ws/repos/          bare mirrors (incl. unpushed workspace branches)
+#   ~/.config/ws/               repo list + activity ranking cache
+#   ~/.llm-usage-key            gateway bearer token
+#   ~/.llm-usage-user           gateway user id
+#   ~/.llm-usage-config         gateway base URL
+#   ~/.llm-usage-models.json    cached model catalog
+#
+# ponytail: this list is the whole contract between install and user data. If you
+# ever add a `rm` touching one of these, you are deleting someone's work.
+PRESERVED_PATHS=(
+  "$HOME/workspaces"
+  "$HOME/.cache/ws"
+  "$HOME/.config/ws"
+  "$HOME/.llm-usage-key"
+  "$HOME/.llm-usage-user"
+  "$HOME/.llm-usage-config"
+  "$HOME/.llm-usage-models.json"
+)
+
+assert_preserved() {
+  for p in "${PRESERVED_PATHS[@]}"; do
+    case "$1" in
+      *"$p"*|*"~/${p##*/}"*) echo "FATAL: install step would delete preserved path: $p" >&2; exit 1 ;;
+    esac
+  done
+}
+
 if $DO_INSTALL; then
   echo "Installing DevTools.app to $INSTALL_DIR..."
   pkill -f "$APP_DIR/Contents/MacOS/DevTools" 2>/dev/null || true
   sleep 1
+  assert_preserved "$INSTALL_DIR/$APP_DIR"
   rm -rf "$INSTALL_DIR/$APP_DIR"
   mv "$APP_DIR" "$INSTALL_DIR/$APP_DIR"
   
   echo "Installing 'ws' CLI..."
   USER_BIN="$HOME/.local/bin"
   mkdir -p "$USER_BIN"
+  assert_preserved "$USER_BIN/ws"
   cp ".build/release/ws" "$USER_BIN/ws"
   chmod +x "$USER_BIN/ws"
   echo "CLI installed to $USER_BIN/ws"
   
-  if cp ".build/release/ws" "/usr/local/bin/ws" 2>/dev/null; then
+  if assert_preserved "/usr/local/bin/ws" && cp ".build/release/ws" "/usr/local/bin/ws" 2>/dev/null; then
     chmod +x "/usr/local/bin/ws"
     echo "CLI also linked to /usr/local/bin/ws"
   fi

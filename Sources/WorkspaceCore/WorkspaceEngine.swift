@@ -32,6 +32,16 @@ public final class WorkspaceEngine: @unchecked Sendable {
         }
     }
     
+    /// Path to the ws binary shipped inside the app bundle, if we're running from one.
+    /// Used as the install source when `ws` is missing from PATH.
+    private var bundledWSPath: String? {
+        let exe = CommandLine.arguments.first ?? ""
+        let macosDir = (exe as NSString).deletingLastPathComponent   // .../Contents/MacOS
+        let contents = (macosDir as NSString).deletingLastPathComponent  // .../Contents
+        let candidate = (contents as NSString).appendingPathComponent("Resources/ws")
+        return FileManager.default.fileExists(atPath: candidate) ? candidate : nil
+    }
+    
     // MARK: - Repo Discovery
     
     private struct GHRow: Decodable {
@@ -181,11 +191,9 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         let gitRes = ProcessRunner.run("which git && git --version")
         items.append(DoctorItem(
             name: "git",
-            command: "git",
             required: true,
             installed: gitRes.exitCode == 0,
             version: gitRes.stdout.components(separatedBy: "\n").last,
-            path: gitRes.stdout.components(separatedBy: "\n").first,
             installCommand: "brew install git"
         ))
         
@@ -195,7 +203,6 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         let ghInstalled = ghRes.exitCode == 0
         items.append(DoctorItem(
             name: "gh (GitHub CLI)",
-            command: "gh",
             required: true,
             installed: ghInstalled,
             version: ghRes.stdout.components(separatedBy: "\n").first,
@@ -213,11 +220,9 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             let httpsOK = httpsProbe.exitCode == 0
             items.append(DoctorItem(
                 name: "Git clone auth",
-                command: "git ls-remote",
                 required: true,
                 installed: sshOK || httpsOK,
                 version: nil,
-                path: nil,
                 details: sshOK
                     ? "SSH key works"
                     : (httpsOK ? "SSH key missing; using HTTPS + gh token" : "No working transport"),
@@ -229,11 +234,10 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         let nodeRes = ProcessRunner.run("which node && node -v")
         items.append(DoctorItem(
             name: "node",
-            command: "node",
             required: true,
             installed: nodeRes.exitCode == 0,
             version: nodeRes.stdout.components(separatedBy: "\n").last,
-            path: nodeRes.stdout.components(separatedBy: "\n").first,
+            details: nodeRes.stdout.components(separatedBy: "\n").first,
             installCommand: "brew install node"
         ))
         
@@ -241,11 +245,9 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         let pyRes = ProcessRunner.run("which python3 && python3 --version")
         items.append(DoctorItem(
             name: "python3",
-            command: "python3",
             required: true,
             installed: pyRes.exitCode == 0,
             version: pyRes.stdout.components(separatedBy: "\n").last,
-            path: pyRes.stdout.components(separatedBy: "\n").first,
             installCommand: "brew install python3"
         ))
         
@@ -254,11 +256,9 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         let cbmInstalled = cbmRes.exitCode == 0
         items.append(DoctorItem(
             name: "codebase-memory-mcp",
-            command: "codebase-memory-mcp",
             required: true,
             installed: cbmInstalled,
             version: cbmInstalled ? ProcessRunner.run("codebase-memory-mcp --version").stdout : nil,
-            path: cbmInstalled ? cbmRes.stdout : nil,
             details: cbmInstalled ? "Ready for AST indexing" : "Required for AI agent cross-repo graph",
             installCommand: "npm install -g codebase-memory-mcp"
         ))
@@ -267,13 +267,28 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         let iterm = ProcessRunner.run("test -d /Applications/iTerm.app")
         items.append(DoctorItem(
             name: "iTerm2",
-            command: "iTerm",
             required: false,
             installed: iterm.exitCode == 0,
             version: nil,
-            path: iterm.exitCode == 0 ? "/Applications/iTerm.app" : nil,
             details: iterm.exitCode == 0 ? "Preferred terminal for 'Open in'" : "Not installed — falling back to Terminal.app",
             installCommand: "brew install --cask iterm2"
+        ))
+        
+        // 7. Our own CLI. Self-check that the bundle's ws binary is still linked on PATH;
+        // reinstalling or cleaning PATH breaks it silently.
+        let wsRes = ProcessRunner.run("which ws")
+        let wsFound = wsRes.exitCode == 0
+        items.append(DoctorItem(
+            name: "ws CLI",
+            required: true,
+            installed: wsFound,
+            version: wsFound ? ProcessRunner.run("ws --help").stdout.components(separatedBy: "\n").first : nil,
+            details: wsFound
+                ? "Workspace orchestrator available in Terminal"
+                : (bundledWSPath.map { "Bundled at \($0)" } ?? "Not linked on PATH"),
+            installCommand: bundledWSPath.map { src in
+                "mkdir -p \"$HOME/.local/bin\" && cp \"\(src)\" \"$HOME/.local/bin/ws\" && chmod +x \"$HOME/.local/bin/ws\""
+            }
         ))
         
         // 6. Coding agents (optional — user installs only what they want).
@@ -292,11 +307,9 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             let found = res.exitCode == 0
             items.append(DoctorItem(
                 name: agentName,
-                command: agentName,
                 required: false,
                 installed: found,
                 version: found ? res.stdout.components(separatedBy: "\n").last : nil,
-                path: found ? res.stdout.components(separatedBy: "\n").first : nil,
                 details: found ? note : note,
                 installCommand: installCmd,
                 category: "agent"
@@ -380,11 +393,8 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             let daysOld = now.timeIntervalSince(maxModDate) / 86400.0
             let isStale = daysOld > 14.0
             
-            let ticket = name.split(separator: "-").first.map(String.init) ?? name
-            
             list.append(WorkspaceInfo(
                 name: name,
-                ticket: ticket,
                 path: wsPath,
                 repos: repos,
                 branches: branches,
@@ -411,7 +421,7 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         case repoStarted(String)
         case repoPhase(String, RepoPhase)
         case indexing
-        case complete(String)   // workspace path
+        case complete
     }
     
     public func createWorkspace(
@@ -453,7 +463,7 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         onProgress(.indexing)
         _ = reindexWorkspace(workspacePath: wsPath)
         
-        onProgress(.complete(wsPath))
+        onProgress(.complete)
         return wsPath
     }
     
@@ -490,7 +500,7 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         }
         
         guard !added.isEmpty else {
-            onProgress(.complete(wsPath))
+            onProgress(.complete)
             return
         }
         
@@ -504,7 +514,7 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         
         onProgress(.indexing)
         _ = reindexWorkspace(workspacePath: wsPath)
-        onProgress(.complete(wsPath))
+        onProgress(.complete)
     }
     
     // MARK: - Shared per-repo provisioning
@@ -522,14 +532,28 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         
         if !FileManager.default.fileExists(atPath: barePath) {
             onProgress(.repoPhase(repo.name, .mirror))
-            let cloneRes = ProcessRunner.run("git clone --mirror \(repo.cloneUrl) \"\(barePath)\"")
+            // --bare, NOT --mirror. --mirror sets remote.origin.fetch=+refs/*:refs/*, so a
+            // fetch writes remote refs over local refs/heads and deletes anything the remote
+            // lacks — i.e. every unpushed workspace branch.
+            let cloneRes = ProcessRunner.run("git clone --bare \(repo.cloneUrl) \"\(barePath)\"")
             if cloneRes.exitCode != 0 {
                 throw NSError(domain: "ws", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to mirror \(repo.name): \(cloneRes.stderr)"])
             }
-        } else {
-            onProgress(.repoPhase(repo.name, .mirror))
-            _ = ProcessRunner.run("git --git-dir=\"\(barePath)\" fetch --all --prune", timeout: 120)
         }
+        
+        onProgress(.repoPhase(repo.name, .mirror))
+        // Harden the mirror against branch loss. Two independent things cause it and both
+        // are neutralised here:
+        //   1. --mirror's +refs/*:refs/* refspec, written by older versions.
+        //   2. `fetch.prune=true` in the user's ~/.gitconfig, which makes EVERY git fetch
+        //      prune by default. This was the actual cause: it silently deleted unpushed
+        //      workspace branches on every `ws create` / `ws add`.
+        // Verified: with prune active, a probe branch was deleted on fetch; with
+        // -c fetch.prune=false it survives.
+        _ = ProcessRunner.run("git --git-dir=\"\(barePath)\" config remote.origin.mirror false")
+        _ = ProcessRunner.run("git --git-dir=\"\(barePath)\" config remote.origin.fetch '+refs/heads/*:refs/heads/*'")
+        _ = ProcessRunner.run("git --git-dir=\"\(barePath)\" config fetch.prune false")
+        _ = ProcessRunner.run("git -c fetch.prune=false --git-dir=\"\(barePath)\" fetch --all", timeout: 120)
         
         onProgress(.repoPhase(repo.name, .worktree))
         let targetRepoPath = (wsPath as NSString).appendingPathComponent(repo.name)
@@ -567,6 +591,66 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         
         installGitHook(at: targetRepoPath)
         onProgress(.repoPhase(repo.name, .indexed))
+    }
+    
+    // MARK: - Remove Repos from Workspace
+    
+    /// Removes repos from a live workspace.
+    ///
+    /// The worktree directory and its registration are removed, but the BRANCH stays in
+    /// the mirror. That branch may hold unpushed commits; destroying it would throw away
+    /// work the engineer cannot get back. It can always be re-added later with `ws add`.
+    ///
+    /// - Parameter force: required when a repo has uncommitted changes.
+    public func removeRepos(
+        fromWorkspace workspaceName: String,
+        repoNames: [String],
+        force: Bool = false
+    ) throws {
+        let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
+        let wsPath = (wsRoot as NSString).appendingPathComponent(workspaceName)
+        guard FileManager.default.fileExists(atPath: wsPath) else {
+            throw NSError(domain: "ws", code: 8, userInfo: [NSLocalizedDescriptionKey: "Workspace not found: \(workspaceName)"])
+        }
+        
+        for repo in repoNames {
+            let repoPath = (wsPath as NSString).appendingPathComponent(repo)
+            guard FileManager.default.fileExists(atPath: repoPath) else { continue }
+            
+            // Uncommitted work check — same rule as pruning a whole workspace.
+            if !force {
+                let status = ProcessRunner.run("git status --porcelain", currentDirectory: repoPath)
+                if !status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    throw NSError(domain: "ws", code: 9, userInfo: [
+                        NSLocalizedDescriptionKey: "'\(repo)' has uncommitted changes. Commit or push them, or confirm to discard."
+                    ])
+                }
+            }
+            
+            // Ask the worktree which mirror owns it so we prune the right git dir.
+            let commonDir = ProcessRunner.run("git rev-parse --git-common-dir", currentDirectory: repoPath).stdout
+            let mirrorGitDir = (commonDir as NSString).expandingTildeInPath
+            
+            _ = ProcessRunner.run("git worktree remove --force \"\(repoPath)\"", currentDirectory: repoPath)
+            if !commonDir.isEmpty {
+                _ = ProcessRunner.run("git --git-dir=\"\(mirrorGitDir)\" worktree prune")
+            }
+            // Belt and braces: the directory may survive if git refused.
+            if FileManager.default.fileExists(atPath: repoPath) {
+                try? FileManager.default.removeItem(atPath: repoPath)
+            }
+            // Note: the branch itself is intentionally left in the mirror.
+        }
+        
+        // Rewrite the context file so it lists the remaining repos.
+        let present = (try? FileManager.default.contentsOfDirectory(atPath: wsPath))?
+            .filter { sub in
+                FileManager.default.fileExists(atPath: (wsPath as NSString).appendingPathComponent("\(sub)/.git"))
+            } ?? []
+        writeContextFile(ticket: workspaceName, repos: present.sorted(), wsPath: wsPath)
+        
+        // Re-index so the graph drops the removed repos.
+        _ = reindexWorkspace(workspacePath: wsPath)
     }
     
     private func writeContextFile(ticket: String, repos: [String], wsPath: String) {
@@ -666,12 +750,21 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             }
         }
         
-        // Remove worktrees properly
+        // Remove worktrees properly, then clear the mirror's worktree registry. The mirror
+        // is what actually stores the refs, so without this it keeps dangling entries
+        // pointing at the deleted directory and `worktree add` fails next time.
+        // Branches are deliberately left in the mirror: they may hold unpushed commits,
+        // and removing the workspace must never destroy them.
         if let subEntries = try? FileManager.default.contentsOfDirectory(atPath: wsPath) {
             for sub in subEntries {
                 let subPath = (wsPath as NSString).appendingPathComponent(sub)
-                if FileManager.default.fileExists(atPath: (subPath as NSString).appendingPathComponent(".git")) {
-                    _ = ProcessRunner.run("git worktree remove --force \"\(subPath)\"", currentDirectory: subPath)
+                guard FileManager.default.fileExists(atPath: (subPath as NSString).appendingPathComponent(".git")) else { continue }
+                // Ask the worktree which mirror owns it, then prune that mirror.
+                let commonDir = ProcessRunner.run("git rev-parse --git-common-dir", currentDirectory: subPath).stdout
+                _ = ProcessRunner.run("git worktree remove --force \"\(subPath)\"", currentDirectory: subPath)
+                if !commonDir.isEmpty {
+                    let mirrorGitDir = (commonDir as NSString).expandingTildeInPath
+                    _ = ProcessRunner.run("git --git-dir=\"\(mirrorGitDir)\" worktree prune")
                 }
             }
         }

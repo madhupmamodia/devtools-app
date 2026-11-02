@@ -45,6 +45,22 @@ struct WSCli {
                 exit(1)
             }
             
+        case "remove", "rm":
+            guard args.count >= 3 else {
+                print("Error: Usage: ws remove <workspace> <repo...> [--force]")
+                exit(1)
+            }
+            let wsName = args[1]
+            let repos = Array(args.dropFirst(2)).filter { !$0.hasPrefix("-") }
+            do {
+                try engine.removeRepos(fromWorkspace: wsName, repoNames: repos, force: args.contains("--force"))
+                print("Removed from \(wsName): \(repos.joined(separator: ", "))")
+                print("Branches kept in the mirror — re-add any time with: ws add \(wsName) <repo>")
+            } catch {
+                print("Error: \(error.localizedDescription)")
+                exit(1)
+            }
+            
         case "reindex":
             guard args.count >= 2 else {
                 print("Error: Ticket/workspace name required. e.g. 'ws reindex FINX-1234'")
@@ -93,6 +109,7 @@ struct WSCli {
           ws list [--json]                 List active workspaces and git status
           ws create <ticket> [repos...]    Create worktrees and index with CMB
           ws add <ws> <repo...>      Add repos to an existing workspace
+          ws remove <ws> <repo...>   Remove repos from a workspace (branches are kept)
           ws reindex <name>                Re-run codebase-memory-mcp index
           ws prune <name> [--force]        Safely remove worktrees and workspace
           ws repos [--json] [--sync]      List configured repositories, or refresh from GitHub org
@@ -224,7 +241,7 @@ struct WSCli {
         case .repoStarted(let r): return "\(r): starting"
         case .repoPhase(let r, let p): return "\(r): \(p.rawValue)"
         case .indexing: return "indexing semantic graph"
-        case .complete(let path): return "ready at \(path)"
+        case .complete: return "ready"
         }
     }
     

@@ -46,6 +46,9 @@ struct WorkspacesRootView: View {
                 if store.addRepoTarget != nil {
                     addRepoSheet
                 }
+                if store.removeRepoTarget != nil {
+                    removeRepoSheet
+                }
             case .create:
                 workspaceCreateView
             case .doctor:
@@ -261,14 +264,13 @@ struct WorkspacesRootView: View {
     }
 
     private func phaseIcon(_ phase: WorkspaceEngine.ProvisionEvent.RepoPhase) -> some View {
-        switch phase {
-        case .waiting:
-            return AnyView(Image(systemName: "circle").foregroundStyle(.tertiary))
-        case .mirror, .worktree:
-            return AnyView(Image(systemName: "circle.dotted").foregroundStyle(.orange))
-        case .indexed:
-            return AnyView(Image(systemName: "checkmark.circle.fill").foregroundStyle(.green))
+        // One concrete return type; a bare switch can't unify ForegroundStyle<Self>.
+        let spec: (String, Color) = switch phase {
+        case .waiting: ("circle", Color.secondary.opacity(0.6))
+        case .mirror, .worktree: ("circle.dotted", .orange)
+        case .indexed: ("checkmark.circle.fill", .green)
         }
+        return Image(systemName: spec.0).foregroundStyle(spec.1)
     }
 
     private func workspaceCard(_ ws: WorkspaceInfo) -> some View {
@@ -290,8 +292,9 @@ struct WorkspacesRootView: View {
                 // Actions menu
                 Menu {
                     Button("Add Repository…") { store.beginAddRepos(to: ws) }
+                    Button("Remove Repository…") { store.beginRemoveRepos(to: ws) }
                     Divider()
-                    Button(store.hasOpenCodeDesktop ? "Open in OpenCode" : "Open in OpenCode CLI") {
+                    Button("Open in OpenCode") {
                         store.openInOpenCode(workspace: ws)
                     }
                     Button("Open in \(store.preferredTerminalName)") {
@@ -302,6 +305,12 @@ struct WorkspacesRootView: View {
                     }
                     if store.hasCursor {
                         Button("Open in Cursor") { store.openInCursor(workspace: ws) }
+                    }
+                    if store.hasOpenCodeDesktop {
+                        Divider()
+                        Button("Reveal for OpenCode Desktop…") {
+                            store.revealInFinder(workspace: ws)
+                        }
                     }
                     Divider()
                     Button("Re-index MCP Graph") { store.reindex(workspace: ws) }
@@ -527,6 +536,90 @@ struct WorkspacesRootView: View {
                 .disabled(store.isAddingRepos || store.addRepoSelection.isEmpty)
                 Spacer()
                 Text("\(store.addRepoCandidates.count) available")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(10)
+        .background(Color(NSColor.controlBackgroundColor))
+        .cornerRadius(8)
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.3)))
+    }
+
+    // MARK: - Remove Repo Sheet
+    private var removeRepoSheet: some View {
+        let dirty = store.removeDirtyRepos
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Remove from \(store.removeRepoTarget?.name ?? "")")
+                    .font(.headline)
+                Spacer()
+                Button("Cancel") { store.cancelRemoveRepos() }
+                    .controlSize(.small)
+                    .disabled(store.isRemovingRepos)
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    ForEach(store.removeRepoTarget?.repos ?? [], id: \.self) { repo in
+                        Toggle(isOn: Binding(
+                            get: { store.removeRepoSelection.contains(repo) },
+                            set: { sel in
+                                if sel { store.removeRepoSelection.insert(repo) }
+                                else { store.removeRepoSelection.remove(repo) }
+                                store.removeAckDirty = false
+                            }
+                        )) {
+                            HStack(spacing: 6) {
+                                Text(repo)
+                                    .font(.system(size: 12))
+                                    .lineLimit(1)
+                                Spacer(minLength: 4)
+                                let n = store.removeRepoTarget?.dirtyCounts[repo] ?? 0
+                                if n > 0 {
+                                    Text("\(n) uncommitted")
+                                        .font(.system(size: 9, weight: .medium))
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .padding(.vertical, 1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 150)
+
+            if !dirty.isEmpty {
+                Text("\(dirty.count) selected repo(s) have uncommitted changes. Removing discards them.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Toggle("I understand", isOn: $store.removeAckDirty)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+            }
+
+            Text("Branches are kept in the mirror. Re-add any time with Add Repository…")
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack {
+                Button(store.isRemovingRepos ? "Removing…" : "Remove") {
+                    store.commitRemoveRepos()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .controlSize(.small)
+                .disabled(store.isRemovingRepos
+                          || store.removeRepoSelection.isEmpty
+                          || (!dirty.isEmpty && !store.removeAckDirty))
+                Spacer()
+                Text("\(store.removeRepoSelection.count) selected")
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.tertiary)
             }
