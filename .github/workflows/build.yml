@@ -14,13 +14,23 @@ permissions:
 jobs:
   build:
     name: Build .app
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
+
+      # Package.swift declares swift-tools-version 6.0. The runner's default
+      # toolchain is Swift 5.10 (Command Line Tools), which cannot parse it.
+      # Pick the newest Xcode on the image so `swift` resolves to Swift 6.x.
+      - name: Select Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          swift --version
 
       - name: Build release
         run: ./bin/bundle.sh

@@ -33,6 +33,17 @@ if ! command -v swift >/dev/null 2>&1; then
   exit 1
 fi
 
+# Package.swift declares swift-tools-version 6.0. A Swift 5.x toolchain cannot
+# parse it and fails with a confusing "package is using Swift tools version" error.
+# The default `swift` on a CI runner may be the Command Line Tools one, not Xcode's.
+SWIFT_VERSION=$(swift --version 2>/dev/null | grep -oE 'Swift version [0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+if ! printf '%s' "$SWIFT_VERSION" | grep -qE 'Swift version (6|[7-9])\.'; then
+  echo "❌ Need Swift 6.x, found: ${SWIFT_VERSION:-unknown}"
+  echo "   Select a newer Xcode:  sudo xcode-select -s /Applications/Xcode_16.app"
+  exit 1
+fi
+echo "Using ${SWIFT_VERSION}"
+
 echo "Building release artifacts..."
 swift build -c release
 
