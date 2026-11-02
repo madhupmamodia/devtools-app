@@ -77,6 +77,20 @@ public struct WSConfig: Codable {
     }
 }
 
+/// Written to <workspace>/.ws.json. Keeps the ticket separate from the directory
+/// name so branch naming stays consistent now that workspaces carry a name.
+public struct WorkspaceMeta: Codable {
+    public var ticket: String
+    public var name: String
+    public var createdAt: Date
+    
+    public init(ticket: String, name: String, createdAt: Date = Date()) {
+        self.ticket = ticket
+        self.name = name
+        self.createdAt = createdAt
+    }
+}
+
 public enum ProcessRunner {
     /// Node major version the app prefers when several are installed via nvm.
     /// ponytail: one constant, not a settings screen. Bump it when the team moves on.
@@ -143,6 +157,32 @@ public enum ProcessRunner {
         let base = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         return (paths + base.components(separatedBy: ":")).joined(separator: ":")
     }()
+    
+    /// Runs several commands at once, one per working directory, concurrently.
+    /// Results come back in the same order as the inputs.
+    /// ponytail: spawn cost dominates for short git commands, so overlap them.
+    public static func runConcurrent(
+        _ commands: [String],
+        currentDirectories: [String]
+    ) -> [String] {
+        guard !commands.isEmpty else { return [] }
+        var results = [String](repeating: "", count: commands.count)
+        let lock = NSLock()
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "ws.proc.parallel", attributes: .concurrent)
+        
+        for (i, cmd) in commands.enumerated() {
+            let dir = i < currentDirectories.count ? currentDirectories[i] : nil
+            queue.async(group: group) {
+                let out = run(cmd, currentDirectory: dir).stdout
+                lock.lock()
+                results[i] = out
+                lock.unlock()
+            }
+        }
+        group.wait()
+        return results
+    }
     
     public static func run(_ command: String, currentDirectory: String? = nil, timeout: TimeInterval? = nil) -> (exitCode: Int32, stdout: String, stderr: String) {
         let process = Process()

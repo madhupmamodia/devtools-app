@@ -20,13 +20,21 @@ struct WSCli {
             handleList(engine: engine, json: args.contains("--json"))
             
         case "create":
-            guard args.count >= 2 else {
-                print("Error: Ticket identifier required. e.g. 'ws create FINX-1234'")
+            guard args.count >= 3 else {
+                print("Error: Usage: ws create <ticket> <name> [repo...]")
+                print("  e.g. ws create FINX-1234 credit-note-application billing-service")
                 exit(1)
             }
             let ticket = args[1]
-            let repos = Array(args.dropFirst(2)).filter { !$0.hasPrefix("-") }
-            handleCreate(engine: engine, ticket: ticket, repos: repos)
+            let wsName = args[2]
+            let repos = Array(args.dropFirst(3)).filter { !$0.hasPrefix("-") }
+            let all = args.contains("--all")
+            if repos.isEmpty && !all {
+                print("Error: Name the repositories to mount, e.g. 'ws create \(ticket) \(wsName) billing-service'")
+                print("       Or pass --all to mount every repository in the catalog (\(engine.config.repos.count)).")
+                exit(1)
+            }
+            handleCreate(engine: engine, ticket: ticket, name: wsName, repos: repos, all: all)
             
         case "add":
             guard args.count >= 3 else {
@@ -107,7 +115,8 @@ struct WSCli {
         Usage:
           ws doctor [--fix] [--json]       Check system prerequisites & AI agents
           ws list [--json]                 List active workspaces and git status
-          ws create <ticket> [repos...]    Create worktrees and index with CMB
+          ws create <ticket> <name> <repo...>  Create worktrees and index with CMB
+          (add --all to mount every repo in the catalog)
           ws add <ws> <repo...>      Add repos to an existing workspace
           ws remove <ws> <repo...>   Remove repos from a workspace (branches are kept)
           ws reindex <name>                Re-run codebase-memory-mcp index
@@ -180,11 +189,11 @@ struct WSCli {
         print("")
     }
     
-    static func handleCreate(engine: WorkspaceEngine, ticket: String, repos: [String]) {
-        let repoSelection = repos.isEmpty ? engine.config.repos.map { $0.name } : repos
+    static func handleCreate(engine: WorkspaceEngine, ticket: String, name: String, repos: [String], all: Bool) {
+        let repoSelection = all ? engine.config.repos.map { $0.name } : repos
         print("Provisioning workspace for \(ticket) with repos: \(repoSelection.joined(separator: ", "))...")
         do {
-            let path = try engine.createWorkspace(ticket: ticket, selectedRepoNames: repoSelection) { ev in
+            let path = try engine.createWorkspace(ticket: ticket, name: name, selectedRepoNames: repoSelection) { ev in
                 print("  -> \(describe(ev))")
             }
             print("\nDone. Workspace ready at:\ncd \(path)")
@@ -240,6 +249,7 @@ struct WSCli {
         switch ev {
         case .repoStarted(let r): return "\(r): starting"
         case .repoPhase(let r, let p): return "\(r): \(p.rawValue)"
+        case .repoSkipped(let r, let why): return "\(r): skipped (\(why))"
         case .indexing: return "indexing semantic graph"
         case .complete: return "ready"
         }

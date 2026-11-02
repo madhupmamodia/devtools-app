@@ -12,6 +12,7 @@ public final class WorkspacesStore: ObservableObject {
     @Published public var selectedTab: WSTab = .list
     @Published public var isRunningDoctor: Bool = false
     @Published public var installingItemID: String?
+    @Published public var isScanning: Bool = false
     @Published public var isProvisioning: Bool = false
     @Published public var statusMessage: String?
     @Published public var statusError: String?
@@ -45,11 +46,17 @@ public final class WorkspacesStore: ObservableObject {
     
     // Creation Sheet State
     @Published public var ticketInput: String = ""
+    @Published public var nameInput: String = ""
     @Published public var selectedRepoNames: Set<String> = []
     @Published public var repoSearchText: String = ""
     @Published public var isSyncingRepos: Bool = false
     @Published public var repoUsage: WorkspaceEngine.RepoUsage?
     @Published public var isSyncingUsage: Bool = false
+    
+        /// Live slug preview of the name field, capped the same way the engine caps it.
+    public var nameSlug: String {
+        WorkspaceEngine.normalizeName(nameInput)
+    }
     
     public func usageScore(for repo: String) -> Int {
         guard let usage = repoUsage else { return 0 }
@@ -141,16 +148,41 @@ public final class WorkspacesStore: ObservableObject {
     
     // ponytail: workspaces load fast, doctor shells out ~14x so it runs in background.
     // Never blocks the tab switch.
+    /// Workspaces only. Runs the git scan off the main actor so switching tabs never
+    /// blocks the UI, and shows the previous list until the new one lands.
+    /// Doctor / repo sync / usage ranking have their own triggers and are NOT
+    /// run here — the doctor alone costs ~14 process spawns plus two network probes.
     public func refreshAll() {
-        self.workspaces = engine.listWorkspaces()
-        self.configuredRepos = engine.config.repos
+        configuredRepos = engine.config.repos
         if repoUsage == nil { repoUsage = engine.loadRepoUsage() }
-        syncReposIfEmpty()
-        syncUsageIfStale()
+        guard !isScanning else { return }
+        isScanning = true
+        Task.detached { [engine = self.engine] in
+            let found = engine.listWorkspaces()
+            await MainActor.run {
+                self.workspaces = found
+                self.isScanning = false
+            }
+        }
+    }
+    
+    /// Doctor scan. Triggered by opening the Doctor tab or hitting Refresh there,
+    /// not by every tab switch.
+    public func refreshDoctor() {
+        guard !isRunningDoctor else { return }
+        isRunningDoctor = true
         Task.detached { [engine = self.engine] in
             let items = engine.checkDoctor()
-            await MainActor.run { self.doctorItems = items }
+            await MainActor.run {
+                self.doctorItems = items
+                self.isRunningDoctor = false
+            }
         }
+    }
+    
+    public func syncReposAndUsage() {
+        syncReposIfEmpty()
+        syncUsageIfStale()
     }
     
     /// Installs a single tool. ponytail: users pick what they want — never blanket-install
@@ -391,12 +423,18 @@ public final class WorkspacesStore: ObservableObject {
             fail("Ticket ID cannot be empty.", owner: .create)
             return
         }
+        let slug = WorkspaceEngine.normalizeName(nameInput)
+        guard !slug.isEmpty else {
+            fail("Workspace name cannot be empty.", owner: .create)
+            return
+        }
         guard !selectedRepoNames.isEmpty else {
             fail("Select at least one repo.", owner: .create)
             return
         }
         
         let ticket = ticketInput.trimmingCharacters(in: .whitespaces).uppercased()
+        let name = slug
         let repos = Array(selectedRepoNames)
         
         isProvisioning = true
@@ -413,7 +451,7 @@ public final class WorkspacesStore: ObservableObject {
         
         Task.detached { [engine = self.engine] in
             do {
-                _ = try engine.createWorkspace(ticket: ticket, selectedRepoNames: repos) { ev in
+                _ = try engine.createWorkspace(ticket: ticket, name: name, selectedRepoNames: repos) { ev in
                     Task { @MainActor in self.apply(ev) }
                 }
                 await MainActor.run {
@@ -437,6 +475,8 @@ public final class WorkspacesStore: ObservableObject {
             if let i = ap.repos.firstIndex(where: { $0.repo == r }) { ap.repos[i].phase = .mirror }
         case .repoPhase(let r, let phase):
             if let i = ap.repos.firstIndex(where: { $0.repo == r }) { ap.repos[i].phase = phase }
+        case .repoSkipped(let r, _):
+            if let i = ap.repos.firstIndex(where: { $0.repo == r }) { ap.repos[i].phase = .skipped }
         case .indexing:
             ap.indexing = true
         case .complete:
@@ -464,6 +504,7 @@ public final class WorkspacesStore: ObservableObject {
     /// Fresh form for the next ticket. Keeps repo list + ranking cache intact.
     public func resetCreateForm() {
         ticketInput = ""
+        nameInput = ""
         selectedRepoNames = []
         repoSearchText = ""
     }

@@ -360,30 +360,41 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             var dirtyCounts: [String: Int] = [:]
             var maxModDate = (try? FileManager.default.attributesOfItem(atPath: wsPath)[.modificationDate] as? Date) ?? now
             
-            for sub in subEntries {
-                let subPath = (wsPath as NSString).appendingPathComponent(sub)
-                let gitPath = (subPath as NSString).appendingPathComponent(".git")
-                if FileManager.default.fileExists(atPath: gitPath) {
-                    repos.append(sub)
-                    
-                    // branch
-                    let brRes = ProcessRunner.run("git branch --show-current", currentDirectory: subPath)
-                    branches[sub] = brRes.stdout.isEmpty ? "HEAD" : brRes.stdout
-                    
-                    // dirty count
-                    let statusRes = ProcessRunner.run("git status --porcelain", currentDirectory: subPath)
-                    let count = statusRes.stdout.split(separator: "\n").filter { !$0.isEmpty }.count
-                    dirtyCounts[sub] = count
-                    
-                    // last commit date
-                    let dateRes = ProcessRunner.run("git log -1 --format=%ct", currentDirectory: subPath)
-                    if let ts = Double(dateRes.stdout) {
-                        let commitDate = Date(timeIntervalSince1970: ts)
-                        if commitDate > maxModDate {
-                            maxModDate = commitDate
-                        }
-                    }
+            let gitRepos = subEntries.filter { sub in
+                FileManager.default.fileExists(atPath: (wsPath as NSString).appendingPathComponent("\(sub)/.git"))
+            }
+            repos = gitRepos
+            
+            // One git call per repo instead of three, and all repos in parallel.
+            // `git status --porcelain -b` prints "## <branch>" as the first line and
+            // one line per dirty path after it, so branch and dirty count come from a
+            // single invocation. The old code paid three process spawns per repo.
+            let repoPaths = gitRepos.map { (wsPath as NSString).appendingPathComponent($0) }
+            let statuses = ProcessRunner.runConcurrent(repoPaths.map { path in
+                "git status --porcelain -b"
+            }, currentDirectories: repoPaths)
+            
+            for (idx, sub) in gitRepos.enumerated() {
+                let out = idx < statuses.count ? statuses[idx] : ""
+                var lines = out.split(separator: "\n").map(String.init)
+                
+                // First line: "## branch...tracking [ahead 1]"
+                if let header = lines.first, header.hasPrefix("## ") {
+                    let branch = header.dropFirst(3)
+                        .components(separatedBy: "...").first ?? ""
+                        .trimmingCharacters(in: .whitespaces)
+                    branches[sub] = branch.isEmpty ? "HEAD" : branch
+                    lines.removeFirst()
+                } else {
+                    branches[sub] = "HEAD"
                 }
+                
+                dirtyCounts[sub] = lines.filter { !$0.isEmpty }.count
+                
+                // Staleness from filesystem mtime. The old code ran `git log -1` for
+                // this, which is another process spawn per repo for a badge.
+                let mod = (try? FileManager.default.attributesOfItem(atPath: repoPaths[idx])[.modificationDate] as? Date) ?? now
+                if mod > maxModDate { maxModDate = mod }
             }
             
             // CMB index check
@@ -408,6 +419,82 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         return list
     }
     
+    // MARK: - Naming
+    
+    /// Max characters of the hyphenated name part, excluding the ticket prefix.
+    public static let maxNameLength = 50
+    
+    /// Turns free text into a lowercase hyphenated slug, capped at maxNameLength.
+    /// "Credit Note Application" -> "credit-note-application"
+    public static func normalizeName(_ raw: String) -> String {
+        let lowered = raw.lowercased()
+        var slug = ""
+        var lastWasHyphen = false
+        for ch in lowered {
+            if ch.isLetter || ch.isNumber {
+                slug.append(ch)
+                lastWasHyphen = false
+            } else if !lastWasHyphen && !slug.isEmpty {
+                slug.append("-")
+                lastWasHyphen = true
+            }
+        }
+        while slug.hasSuffix("-") { slug.removeLast() }
+        if slug.count > Self.maxNameLength {
+            slug = String(slug.prefix(Self.maxNameLength))
+            // Cut at a word boundary so we do not end mid-word.
+            if let lastHyphen = slug.lastIndex(of: "-") {
+                slug = String(slug[...lastHyphen])
+            }
+            while slug.hasSuffix("-") { slug.removeLast() }
+        }
+        return slug
+    }
+    
+    /// Directory name for a workspace: <TICKET>-<name>.
+    public static func workspaceDirName(ticket: String, name: String) -> String {
+        "\(ticket)-\(name)"
+    }
+    
+    /// Recovers the ticket from a workspace directory name, for workspaces created
+    /// before names existed. Matches a leading ALPHA-DIGITS token.
+    static func ticketFromDirName(_ dirName: String) -> String {
+        let pattern = "^([A-Za-z]+-[0-9]+)"
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: dirName, range: NSRange(dirName.startIndex..., in: dirName)),
+           let range = Range(match.range(at: 1), in: dirName) {
+            return String(dirName[range]).uppercased()
+        }
+        return dirName
+    }
+    
+    private func metaURL(wsPath: String) -> URL {
+        URL(fileURLWithPath: (wsPath as NSString).appendingPathComponent(".ws.json"))
+    }
+    
+    public func readMeta(wsPath: String) -> WorkspaceMeta? {
+        guard let data = try? Data(contentsOf: metaURL(wsPath: wsPath)) else { return nil }
+        return try? JSONDecoder().decode(WorkspaceMeta.self, from: data)
+    }
+    
+    private func writeMeta(ticket: String, name: String, wsPath: String) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(WorkspaceMeta(ticket: ticket, name: name)) {
+            try? data.write(to: metaURL(wsPath: wsPath))
+        }
+    }
+    
+    /// Ticket for a workspace: from .ws.json when present, else derived from the
+    /// directory name. Used for branch naming so it stays stable either way.
+    public func resolveTicket(workspaceName: String) -> String {
+        let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
+        let wsPath = (wsRoot as NSString).appendingPathComponent(workspaceName)
+        if let meta = readMeta(wsPath: wsPath) { return meta.ticket }
+        return Self.ticketFromDirName(workspaceName)
+    }
+    
     // MARK: - Provisioning
 
 /// Structured progress so the UI can render a live card instead of parsing log lines.
@@ -417,15 +504,19 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             case mirror = "Fetching mirror"
             case worktree = "Adding worktree"
             case indexed = "Ready"
+            case skipped = "Skipped"
         }
         case repoStarted(String)
         case repoPhase(String, RepoPhase)
+        /// Repo could not be provisioned (e.g. an empty repo with no commits).
+        case repoSkipped(String, String)
         case indexing
         case complete
     }
     
     public func createWorkspace(
         ticket: String,
+        name: String,
         selectedRepoNames: [String],
         onProgress: @escaping (ProvisionEvent) -> Void
     ) throws -> String {
@@ -433,31 +524,43 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         guard !cleanTicket.isEmpty else {
             throw NSError(domain: "ws", code: 1, userInfo: [NSLocalizedDescriptionKey: "Ticket name cannot be empty."])
         }
+        let cleanName = Self.normalizeName(name)
+        guard !cleanName.isEmpty else {
+            throw NSError(domain: "ws", code: 10, userInfo: [NSLocalizedDescriptionKey: "Workspace name cannot be empty."])
+        }
         
         let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
         let cacheRoot = (config.cacheDirectory as NSString).expandingTildeInPath
-        let wsPath = (wsRoot as NSString).appendingPathComponent(cleanTicket)
+        let wsDirName = Self.workspaceDirName(ticket: cleanTicket, name: cleanName)
+        let wsPath = (wsRoot as NSString).appendingPathComponent(wsDirName)
         
         try FileManager.default.createDirectory(atPath: wsRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(atPath: cacheRoot, withIntermediateDirectories: true)
         
         if FileManager.default.fileExists(atPath: wsPath) {
-            throw NSError(domain: "ws", code: 2, userInfo: [NSLocalizedDescriptionKey: "Workspace \(cleanTicket) already exists at \(wsPath)"])
+            throw NSError(domain: "ws", code: 2, userInfo: [NSLocalizedDescriptionKey: "Workspace \(wsDirName) already exists at \(wsPath)"])
         }
         
         try FileManager.default.createDirectory(atPath: wsPath, withIntermediateDirectories: true)
+        writeMeta(ticket: cleanTicket, name: cleanName, wsPath: wsPath)
         
         let repoDefs = config.repos.filter { selectedRepoNames.contains($0.name) }
         guard !repoDefs.isEmpty else {
             throw NSError(domain: "ws", code: 3, userInfo: [NSLocalizedDescriptionKey: "No valid repositories selected."])
         }
         
+        var provisioned: [String] = []
+        var skipped: [(String, String)] = []
         for repo in repoDefs {
             onProgress(.repoStarted(repo.name))
-            try provision(repo: repo, ticket: cleanTicket, into: wsPath, onProgress: onProgress)
+            let ok = try provision(repo: repo, ticket: cleanTicket, into: wsPath, onProgress: onProgress)
+            if ok { provisioned.append(repo.name) } else { skipped.append((repo.name, "empty repository")) }
+        }
+        if provisioned.isEmpty {
+            throw NSError(domain: "ws", code: 11, userInfo: [NSLocalizedDescriptionKey: "None of the selected repositories could be provisioned. They may all be empty."])
         }
         
-        writeContextFile(ticket: cleanTicket, repos: repoDefs.map { $0.name }, wsPath: wsPath)
+        writeContextFile(ticket: wsDirName, repos: provisioned, wsPath: wsPath)
         registerMcpClients(workspacePath: wsPath)
         
         onProgress(.indexing)
@@ -495,8 +598,8 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
                 continue
             }
             onProgress(.repoStarted(repo.name))
-            try provision(repo: repo, ticket: workspaceName, into: wsPath, onProgress: onProgress)
-            added.append(repo.name)
+            let ok = try provision(repo: repo, ticket: resolveTicket(workspaceName: workspaceName), into: wsPath, onProgress: onProgress)
+            if ok { added.append(repo.name) }
         }
         
         guard !added.isEmpty else {
@@ -520,12 +623,16 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
     // MARK: - Shared per-repo provisioning
     
     /// Mirror-sync + worktree-add + hook install for ONE repo. Shared by create and add.
+    /// Provisions one repo. Returns false when the repo cannot be worked on
+    /// (empty repo with no commits), which is skipped rather than failing the
+    /// whole workspace — the catalog contains a few of those.
+    @discardableResult
     private func provision(
         repo: RepoDefinition,
         ticket: String,
         into wsPath: String,
         onProgress: (ProvisionEvent) -> Void
-    ) throws {
+    ) throws -> Bool {
         let cacheRoot = (config.cacheDirectory as NSString).expandingTildeInPath
         try FileManager.default.createDirectory(atPath: cacheRoot, withIntermediateDirectories: true)
         let barePath = (cacheRoot as NSString).appendingPathComponent("\(repo.name).git")
@@ -562,25 +669,48 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         // ponytail: query refs/heads and branch off the local name. Using origin/* here
         // fails with "invalid reference" on every fresh workspace.
         let existing = ProcessRunner.run("git --git-dir=\"\(barePath)\" branch --list \"*\(ticket)*\"")
-        let candidates = existing.stdout
-            .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
         
-        var branchToUse = ticket
+        // `git branch --list` prefixes the current branch with "* " and any branch
+        // checked out in another worktree with "+ ". Strip those markers, and treat a
+        // "+ " branch as unusable (git will refuse to add it twice).
+        var candidates: [String] = []
+        var checkedOutElsewhere: Set<String> = []
+        for line in existing.stdout.split(separator: "\n") {
+            var name = line.trimmingCharacters(in: .whitespaces)
+            if name.hasPrefix("+ ") {
+                name.removeFirst(2)
+                checkedOutElsewhere.insert(name)
+            } else if name.hasPrefix("* ") {
+                name.removeFirst(2)
+            }
+            if !name.isEmpty { candidates.append(name) }
+        }
+        
         var addCommand = ""
         
         if let matched = candidates.first {
             // Reuse an existing branch (exact ticket name wins over prefix matches).
             let chosen = candidates.first { $0 == ticket } ?? matched
-            branchToUse = chosen
+            if checkedOutElsewhere.contains(chosen) {
+                onProgress(.repoSkipped(repo.name, "branch '\(chosen)' is checked out in another worktree"))
+                return false
+            }
             addCommand = "git --git-dir=\"\(barePath)\" worktree add \"\(targetRepoPath)\" \"\(chosen)\""
         } else {
             // Brand new branch off the repo's default branch.
             let base = repo.defaultBranch
             let baseCheck = ProcessRunner.run("git --git-dir=\"\(barePath)\" rev-parse --verify --quiet \"\(base)\"")
-            let startPoint = baseCheck.exitCode == 0 ? base : "HEAD"
-            addCommand = "git --git-dir=\"\(barePath)\" worktree add -b \"\(ticket)\" \"\(targetRepoPath)\" \"\(startPoint)\""
+            if baseCheck.exitCode == 0 {
+                addCommand = "git --git-dir=\"\(barePath)\" worktree add -b \"\(ticket)\" \"\(targetRepoPath)\" \"\(base)\""
+            } else {
+                // No default branch. Fall back to HEAD only if the repo has commits.
+                let headCheck = ProcessRunner.run("git --git-dir=\"\(barePath)\" rev-parse --verify --quiet HEAD")
+                if headCheck.exitCode != 0 {
+                    onProgress(.repoSkipped(repo.name, "empty repository, no commits"))
+                    return false
+                }
+                addCommand = "git --git-dir=\"\(barePath)\" worktree add -b \"\(ticket)\" \"\(targetRepoPath)\" HEAD"
+            }
         }
         
 
@@ -591,6 +721,7 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         
         installGitHook(at: targetRepoPath)
         onProgress(.repoPhase(repo.name, .indexed))
+        return true
     }
     
     // MARK: - Remove Repos from Workspace
@@ -696,35 +827,116 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         _ = ProcessRunner.run("chmod +x \"\(hookFile)\"")
     }
     
+    /// Absolute path to the codebase-memory-mcp entrypoint, plus the node binary
+    /// that runs it.
+    ///
+    /// Desktop apps (opencode, Cursor) are launched by launchd and inherit a minimal
+    /// PATH of /usr/bin:/bin:/usr/sbin:/sbin. nvm installs are not on it, so a bare
+    /// "codebase-memory-mcp" fails with "command not found" and even an absolute
+    /// path to the script fails because its shebang is #!/usr/bin/env node.
+    /// Resolving both paths up front removes the dependency on PATH entirely.
+    private func codebaseMemoryPaths() -> (command: [String], env: [String: String])? {
+        let searchDirs = ProcessRunner.nvmBinPaths()
+        var nodePath: String?
+        var scriptPath: String?
+        
+        for dir in searchDirs {
+            let node = (dir as NSString).appendingPathComponent("node")
+            if nodePath == nil, FileManager.default.isExecutableFile(atPath: node) {
+                nodePath = node
+            }
+            let script = (dir as NSString).appendingPathComponent("../lib/node_modules/codebase-memory-mcp/bin.js")
+            let resolved = (script as NSString).standardizingPath
+            if scriptPath == nil, FileManager.default.fileExists(atPath: resolved) {
+                scriptPath = resolved
+            }
+        }
+        
+        // Fall back to whatever is on PATH (homebrew, npm global elsewhere).
+        if nodePath == nil {
+            let res = ProcessRunner.run("which node")
+            if res.exitCode == 0 { nodePath = res.stdout }
+        }
+        if scriptPath == nil {
+            let res = ProcessRunner.run("which codebase-memory-mcp")
+            if res.exitCode == 0 { scriptPath = res.stdout }
+        }
+        
+        guard let nodePath, let scriptPath else { return nil }
+        
+        var env: [String: String] = [:]
+        if !searchDirs.isEmpty {
+            env["PATH"] = (searchDirs + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]).joined(separator: ":")
+        }
+        return (command: [nodePath, scriptPath], env: env)
+    }
+    
+    /// Writes the codebase-memory MCP server config for each agent.
+    ///
+    /// Built with JSONSerialization, not string templates. A hand-built template
+    /// silently produced invalid JSON (missing comma, trailing comma) that these
+    /// agents could not parse.
     private func registerMcpClients(workspacePath: String) {
-        // 1. Cursor: <workspace>/.cursor/mcp.json
+        guard let paths = codebaseMemoryPaths() else { return }
+        
+        // A trimmed PATH: the preferred node plus system and homebrew. The full nvm
+        // list is noisy and picks up versions the engineer did not ask for.
+        let nodeDir = (paths.command[0] as NSString).deletingLastPathComponent
+        let pathValue = ([nodeDir, "/opt/homebrew/bin", "/usr/local/bin",
+                          "/usr/bin", "/bin", "/usr/sbin", "/sbin"]).joined(separator: ":")
+        
+        func writeJSON(_ object: Any, to path: String) {
+            guard let data = try? JSONSerialization.data(withJSONObject: object,
+                                                         options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+                  let out = String(data: data, encoding: .utf8) else { return }
+            try? out.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        
+        let env = ["PATH": pathValue]
+        
+        // 1. OpenCode: <workspace>/opencode.json
+        //    OpenCode merges project-level opencode.json over the global one and reads
+        //    MCP servers from the "mcp" key. A .opencode/mcp.json file is NOT read.
+        writeJSON([
+            "$schema": "https://opencode.ai/config.json",
+            "mcp": [
+                "codebase-memory": [
+                    "type": "local",
+                    "command": paths.command,
+                    "environment": env,
+                    "enabled": true
+                ]
+            ]
+        ], to: (workspacePath as NSString).appendingPathComponent("opencode.json"))
+        
+        // 2. Cursor: <workspace>/.cursor/mcp.json — uses the "mcpServers" key.
         let cursorDir = (workspacePath as NSString).appendingPathComponent(".cursor")
         try? FileManager.default.createDirectory(atPath: cursorDir, withIntermediateDirectories: true)
-        let cursorMcp = """
-        {
-          "mcpServers": {
-            "codebase-memory": {
-              "command": "codebase-memory-mcp",
-              "args": []
-            }
-          }
-        }
-        """
-        try? cursorMcp.write(toFile: (cursorDir as NSString).appendingPathComponent("mcp.json"), atomically: true, encoding: .utf8)
+        writeJSON([
+            "mcpServers": [
+                "codebase-memory": [
+                    "command": paths.command[0],
+                    "args": [paths.command[1]],
+                    "environment": env
+                ]
+            ]
+        ], to: (cursorDir as NSString).appendingPathComponent("mcp.json"))
         
-        // 2. OpenCode: <workspace>/.opencode/mcp.json
-        let opencodeDir = (workspacePath as NSString).appendingPathComponent(".opencode")
-        try? FileManager.default.createDirectory(atPath: opencodeDir, withIntermediateDirectories: true)
-        let opencodeMcp = """
-        {
-          "mcpServers": {
-            "codebase-memory": {
-              "command": "codebase-memory-mcp"
-            }
-          }
-        }
-        """
-        try? opencodeMcp.write(toFile: (opencodeDir as NSString).appendingPathComponent("mcp.json"), atomically: true, encoding: .utf8)
+        // 3. Claude Code: <workspace>/.mcp.json — project-scoped MCP servers.
+        writeJSON([
+            "mcpServers": [
+                "codebase-memory": [
+                    "type": "stdio",
+                    "command": paths.command[0],
+                    "args": [paths.command[1]],
+                    "environment": env
+                ]
+            ]
+        ], to: (workspacePath as NSString).appendingPathComponent(".mcp.json"))
+        
+        // Remove the old file. It used the "mcpServers" key in a location OpenCode
+        // never reads, so it was silently ignored.
+        try? FileManager.default.removeItem(atPath: (workspacePath as NSString).appendingPathComponent(".opencode/mcp.json"))
     }
     
     // MARK: - Teardown

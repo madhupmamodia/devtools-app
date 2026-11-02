@@ -269,6 +269,7 @@ struct WorkspacesRootView: View {
         case .waiting: ("circle", Color.secondary.opacity(0.6))
         case .mirror, .worktree: ("circle.dotted", .orange)
         case .indexed: ("checkmark.circle.fill", .green)
+        case .skipped: ("minus.circle", .secondary)
         }
         return Image(systemName: spec.0).foregroundStyle(spec.1)
     }
@@ -370,6 +371,23 @@ struct WorkspacesRootView: View {
 
             TextField("Ticket ID (e.g. FINX-1234)", text: $store.ticketInput)
                 .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 6) {
+                TextField("Name (e.g. credit-note-application)", text: $store.nameInput)
+                    .textFieldStyle(.roundedBorder)
+                Text("\(store.nameSlug.count)/\(WorkspaceEngine.maxNameLength)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(store.nameSlug.count >= WorkspaceEngine.maxNameLength ? Color.red : Color.secondary)
+            }
+
+            // Live preview of the resulting directory name.
+            if !store.ticketInput.trimmingCharacters(in: .whitespaces).isEmpty, !store.nameSlug.isEmpty {
+                Text("\(store.ticketInput.trimmingCharacters(in: .whitespaces).uppercased())-\(store.nameSlug)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
 
             HStack(spacing: 8) {
                 TextField("Search \(store.configuredRepos.count) repos…", text: $store.repoSearchText)
@@ -637,6 +655,11 @@ struct WorkspacesRootView: View {
                 Text("System Readiness Doctor")
                     .font(.headline)
                 Spacer()
+                Button(store.isRunningDoctor ? "Checking…" : "Re-check") {
+                    store.refreshDoctor()
+                }
+                .controlSize(.small)
+                .disabled(store.isRunningDoctor)
                 Button("Fix all missing") {
                     store.runDoctorFixes()
                 }
