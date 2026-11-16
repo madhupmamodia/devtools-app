@@ -73,10 +73,58 @@ struct WorkspacesRootView: View {
                 Color.black.opacity(0.35)
                     .onTapGesture { store.cancelPrune() }
                 pruneDialog
+            } else if store.discardTarget != nil {
+                Color.black.opacity(0.35)
+                    .onTapGesture { store.cancelDiscard() }
+                discardDialog
             }
+        }
+        .onAppear {
+            store.startAutoRefresh()
+        }
+        .onDisappear {
+            store.stopAutoRefresh()
         }
     }
 
+    // MARK: - Discard Confirmation
+    private var discardDialog: some View {
+        Group {
+            if let target = store.discardTarget {
+                VStack(spacing: 10) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "trash")
+                            .foregroundStyle(.red)
+                        Text("Discard changes in \(target.repo)?")
+                            .font(.headline)
+                        Spacer()
+                    }
+                    Text("Uncommitted changes and untracked files are deleted permanently. Committed work is untouched.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack {
+                        Button("Cancel", role: .cancel) { store.cancelDiscard() }
+                            .keyboardShortcut(.cancelAction)
+                        Spacer()
+                        Button("Discard", role: .destructive) {
+                            store.confirmDiscard()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                    }
+                }
+                .padding(12)
+                .frame(width: 360)
+                .background(Color(NSColor.windowBackgroundColor))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.4)))
+                .shadow(radius: 8)
+            }
+        }
+    }
+    
     // MARK: - Prune Confirmation
     //
     // Two-stage on purpose. A dirty workspace only exposes the destructive action
@@ -336,23 +384,40 @@ struct WorkspacesRootView: View {
             // Repos inside
             VStack(alignment: .leading, spacing: 3) {
                 ForEach(ws.repos, id: \.self) { repo in
-                    HStack {
-                        Text(repo)
-                            .font(.caption2)
-                            .foregroundStyle(.primary)
-                        Spacer()
-                        let br = ws.branches[repo] ?? "main"
-                        let dirty = ws.dirtyCounts[repo] ?? 0
-                        Text(br)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                        if dirty > 0 {
-                            Text("\(dirty) dirty")
-                                .font(.system(size: 9))
-                                .padding(.horizontal, 3)
-                                .background(Color.yellow.opacity(0.2))
-                                .foregroundStyle(.yellow)
-                                .cornerRadius(2)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack {
+                            Text(repo)
+                                .font(.caption2)
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            let br = ws.branches[repo] ?? "main"
+                            let dirty = ws.dirtyCounts[repo] ?? 0
+                            Text(br)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            if dirty > 0 {
+                                // Clickable: opens the file list so the count is
+                                // something you can act on, not just a warning.
+                                Button {
+                                    store.toggleDirtyFiles(workspace: ws, repo: repo)
+                                } label: {
+                                    HStack(spacing: 2) {
+                                        Text("\(dirty)")
+                                        Text(store.expandedRepo?.repo == repo ? "dirty ▾" : "dirty ▸")
+                                    }
+                                    .font(.system(size: 9))
+                                    .padding(.horizontal, 3)
+                                    .background(Color.yellow.opacity(0.2))
+                                    .foregroundStyle(.yellow)
+                                    .cornerRadius(2)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Uncommitted changes in \(repo). Click to list them.")
+                            }
+                        }
+                        
+                        if store.expandedRepo?.repo == repo, store.expandedRepo?.workspaceName == ws.name {
+                            dirtyFilePanel(workspace: ws, repo: repo)
                         }
                     }
                 }
@@ -361,6 +426,58 @@ struct WorkspacesRootView: View {
         .padding(8)
         .background(Color(NSColor.controlBackgroundColor))
         .cornerRadius(6)
+    }
+    
+    /// Expanded dirty-file list with the two actions that make the badge worth
+    /// showing: snapshot the work, or throw it away.
+    private func dirtyFilePanel(workspace: WorkspaceInfo, repo: String) -> some View {
+        let files = store.dirtyFileLists[repo] ?? []
+        return VStack(alignment: .leading, spacing: 3) {
+            if files.isEmpty {
+                Text("No uncommitted changes.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(files) { f in
+                    HStack(spacing: 5) {
+                        Text(f.label)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 52, alignment: .leading)
+                        Text(f.path)
+                            .font(.system(size: 10, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+            }
+            
+            HStack(spacing: 6) {
+                Button {
+                    store.commitRepo(workspace, repo: repo)
+                } label: {
+                    Text(store.isWorking ? "Working…" : "Commit all")
+                }
+                .controlSize(.mini)
+                .disabled(store.isWorking || files.isEmpty)
+                
+                Button {
+                    store.requestDiscard(workspace, repo: repo)
+                } label: {
+                    Text("Discard")
+                }
+                .controlSize(.mini)
+                .buttonStyle(.borderless)
+                .foregroundStyle(.red)
+                .disabled(store.isWorking || files.isEmpty)
+                
+                Spacer()
+            }
+            .padding(.top, 2)
+        }
+        .padding(6)
+        .background(Color.secondary.opacity(0.08))
+        .cornerRadius(4)
     }
 
     // MARK: - Create View

@@ -157,13 +157,40 @@ public final class WorkspacesStore: ObservableObject {
         if repoUsage == nil { repoUsage = engine.loadRepoUsage() }
         guard !isScanning else { return }
         isScanning = true
+        let expanded = expandedRepo
+        let expandedWS = expanded?.workspaceName
+        let expandedRepoName = expanded?.repo
         Task.detached { [engine = self.engine] in
             let found = engine.listWorkspaces()
+            // Keep the open file list in step with the counts.
+            var files: [WorkspaceEngine.DirtyFile] = []
+            if let expandedWS, let expandedRepoName {
+                files = engine.dirtyFiles(inWorkspace: expandedWS, repo: expandedRepoName)
+            }
             await MainActor.run {
                 self.workspaces = found
                 self.isScanning = false
+                if let expandedRepoName { self.dirtyFileLists[expandedRepoName] = files }
             }
         }
+    }
+    
+    /// Live refresh. Agents write files continuously, so a count that only updates
+    /// on tab switch is a lie. Polls while the Workspaces tab is on screen.
+    private var autoRefreshTimer: Timer?
+    
+    public func startAutoRefresh(interval: TimeInterval = 10) {
+        stopAutoRefresh()
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshAll() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        autoRefreshTimer = t
+    }
+    
+    public func stopAutoRefresh() {
+        autoRefreshTimer?.invalidate()
+        autoRefreshTimer = nil
     }
     
     /// Doctor scan. Triggered by opening the Doctor tab or hitting Refresh there,
@@ -310,6 +337,87 @@ public final class WorkspacesStore: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.isRemovingRepos = false
+                    self.fail(error.localizedDescription, owner: .list)
+                }
+            }
+        }
+    }
+    
+    // MARK: - Dirty File Actions
+    
+    /// Which repo's dirty file list is expanded.
+    public struct ExpandedRepo: Equatable {
+        public let workspaceName: String
+        public let repo: String
+    }
+    @Published public var expandedRepo: ExpandedRepo?
+    @Published public var dirtyFileLists: [String: [WorkspaceEngine.DirtyFile]] = [:]
+    @Published public var discardTarget: (workspace: String, repo: String)?
+    @Published public var isWorking: Bool = false
+    
+    /// Toggles the file list for a repo. Fetched on demand so the list scan stays cheap.
+    public func toggleDirtyFiles(workspace: WorkspaceInfo, repo: String) {
+        let target = ExpandedRepo(workspaceName: workspace.name, repo: repo)
+        if expandedRepo == target {
+            expandedRepo = nil
+            return
+        }
+        expandedRepo = target
+        let wsName = workspace.name
+        Task.detached { [engine = self.engine] in
+            let files = engine.dirtyFiles(inWorkspace: wsName, repo: repo)
+            await MainActor.run { self.dirtyFileLists[repo] = files }
+        }
+    }
+    
+    public func commitRepo(_ workspace: WorkspaceInfo, repo: String) {
+        isWorking = true
+        let message = "chore(\(workspace.name)): workspace changes"
+        let wsName = workspace.name
+        Task.detached { [engine = self.engine] in
+            do {
+                try engine.commitAll(inWorkspace: wsName, repo: repo, message: message)
+                await MainActor.run {
+                    self.isWorking = false
+                    self.flash("Committed \(repo).", owner: .list)
+                    self.dirtyFileLists[repo] = []
+                    self.refreshAll()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isWorking = false
+                    self.fail(error.localizedDescription, owner: .list)
+                }
+            }
+        }
+    }
+    
+    public func requestDiscard(_ workspace: WorkspaceInfo, repo: String) {
+        discardTarget = (workspace: workspace.name, repo: repo)
+    }
+    
+    public func cancelDiscard() {
+        discardTarget = nil
+    }
+    
+    public func confirmDiscard() {
+        guard let target = discardTarget else { return }
+        discardTarget = nil
+        isWorking = true
+        let wsName = target.workspace
+        let repoName = target.repo
+        Task.detached { [engine = self.engine] in
+            do {
+                try engine.discardChanges(inWorkspace: wsName, repo: repoName)
+                await MainActor.run {
+                    self.isWorking = false
+                    self.flash("Discarded changes in \(repoName).", owner: .list)
+                    self.dirtyFileLists[repoName] = []
+                    self.refreshAll()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isWorking = false
                     self.fail(error.localizedDescription, owner: .list)
                 }
             }

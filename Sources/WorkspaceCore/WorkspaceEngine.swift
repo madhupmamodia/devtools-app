@@ -939,6 +939,98 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         try? FileManager.default.removeItem(atPath: (workspacePath as NSString).appendingPathComponent(".opencode/mcp.json"))
     }
     
+    // MARK: - Working Tree Actions
+    
+    public struct DirtyFile: Identifiable {
+        public var id: String { path }
+        /// Two-character porcelain status, e.g. " M", "??", "A ".
+        public let status: String
+        public let path: String
+        
+        public var label: String {
+            switch status.trimmingCharacters(in: .whitespaces).prefix(1) {
+            case "?": return "new"
+            case "M": return "modified"
+            case "A": return "added"
+            case "D": return "deleted"
+            case "R": return "renamed"
+            default: return status.trimmingCharacters(in: .whitespaces)
+            }
+        }
+    }
+    
+    /// Files with uncommitted changes in a worktree. Fetched on demand, not during
+    /// the list scan, so the scan stays cheap.
+    public func dirtyFiles(inWorkspace workspaceName: String, repo: String) -> [DirtyFile] {
+        let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
+        let repoPath = ((wsRoot as NSString)
+            .appendingPathComponent(workspaceName) as NSString)
+            .appendingPathComponent(repo)
+        guard FileManager.default.fileExists(atPath: repoPath) else { return [] }
+        
+        let res = ProcessRunner.run("git status --porcelain", currentDirectory: repoPath)
+        guard res.exitCode == 0 else { return [] }
+        
+        return res.stdout.split(separator: "\n").compactMap { line in
+            let raw = String(line)
+            guard raw.count > 3 else { return nil }
+            let status = String(raw.prefix(2))
+            let path = String(raw.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            guard !path.isEmpty else { return nil }
+            return DirtyFile(status: status, path: path)
+        }
+    }
+    
+    /// Commits everything in a worktree. Message defaults to the ticket so the
+    /// history is traceable back to the workspace.
+    @discardableResult
+    public func commitAll(inWorkspace workspaceName: String, repo: String, message: String) throws -> String {
+        let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
+        let repoPath = ((wsRoot as NSString)
+            .appendingPathComponent(workspaceName) as NSString)
+            .appendingPathComponent(repo)
+        guard FileManager.default.fileExists(atPath: repoPath) else {
+            throw NSError(domain: "ws", code: 12, userInfo: [NSLocalizedDescriptionKey: "Repo not found: \(repo)"])
+        }
+        
+        let add = ProcessRunner.run("git add -A", currentDirectory: repoPath)
+        guard add.exitCode == 0 else {
+            throw NSError(domain: "ws", code: 13, userInfo: [NSLocalizedDescriptionKey: "git add failed: \(add.stderr)"])
+        }
+        
+        let commit = ProcessRunner.run("git commit -m \"\(shellQuote(message))\"", currentDirectory: repoPath)
+        guard commit.exitCode == 0 else {
+            throw NSError(domain: "ws", code: 14, userInfo: [NSLocalizedDescriptionKey: "git commit failed: \(commit.stderr)"])
+        }
+        return commit.stdout
+    }
+    
+    /// Throws away uncommitted changes in a worktree. Destructive by definition.
+    public func discardChanges(inWorkspace workspaceName: String, repo: String) throws {
+        let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
+        let repoPath = ((wsRoot as NSString)
+            .appendingPathComponent(workspaceName) as NSString)
+            .appendingPathComponent(repo)
+        guard FileManager.default.fileExists(atPath: repoPath) else {
+            throw NSError(domain: "ws", code: 12, userInfo: [NSLocalizedDescriptionKey: "Repo not found: \(repo)"])
+        }
+        
+        // reset --hard drops tracked changes, clean -fd removes untracked files.
+        let reset = ProcessRunner.run("git reset --hard", currentDirectory: repoPath)
+        guard reset.exitCode == 0 else {
+            throw NSError(domain: "ws", code: 15, userInfo: [NSLocalizedDescriptionKey: "git reset failed: \(reset.stderr)"])
+        }
+        let clean = ProcessRunner.run("git clean -fd", currentDirectory: repoPath)
+        guard clean.exitCode == 0 else {
+            throw NSError(domain: "ws", code: 16, userInfo: [NSLocalizedDescriptionKey: "git clean failed: \(clean.stderr)"])
+        }
+    }
+    
+    /// Single-quote for POSIX shell.
+    private func shellQuote(_ s: String) -> String {
+        "'\(s.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+    
     // MARK: - Teardown
     public func pruneWorkspace(name: String, force: Bool = false) throws {
         let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
