@@ -171,26 +171,46 @@ public final class WorkspacesStore: ObservableObject {
                 self.workspaces = found
                 self.isScanning = false
                 if let expandedRepoName { self.dirtyFileLists[expandedRepoName] = files }
+                self.watcher.sync(workspaces: found)
             }
         }
     }
     
-    /// Live refresh. Agents write files continuously, so a count that only updates
-    /// on tab switch is a lie. Polls while the Workspaces tab is on screen.
-    private var autoRefreshTimer: Timer?
+    /// Live refresh via FSEvents. The kernel notifies us when an agent writes a
+    /// file, so we re-read only that repo instead of polling every repo on a timer.
+    /// Idle cost is zero.
+    /// Must be the shared instance: the global FSEvents C callback routes through
+    /// WorkspaceWatcher.shared, so a private instance would never receive events.
+    private let watcher = WorkspaceWatcher.shared
     
-    public func startAutoRefresh(interval: TimeInterval = 10) {
-        stopAutoRefresh()
-        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshAll() }
+    public func startAutoRefresh() {
+        watcher.onChange = { [weak self] workspace, repo in
+            Task { @MainActor in self?.refreshRepo(workspace: workspace, repo: repo) }
         }
-        RunLoop.main.add(t, forMode: .common)
-        autoRefreshTimer = t
+        watcher.sync(workspaces: workspaces)
     }
     
     public func stopAutoRefresh() {
-        autoRefreshTimer?.invalidate()
-        autoRefreshTimer = nil
+        watcher.onChange = nil
+        watcher.stop()
+    }
+    
+    /// Re-reads the status of one repo and updates just that repo's counts.
+    private func refreshRepo(workspace: String, repo: String) {
+        guard let ws = workspaces.first(where: { $0.name == workspace }),
+              ws.repos.contains(repo) else { return }
+        Task.detached { [engine = self.engine] in
+            let files = engine.dirtyFiles(inWorkspace: workspace, repo: repo)
+            await MainActor.run {
+                self.dirtyFileLists[repo] = files
+                // Reuse the cached list to patch the count in place.
+                if let idx = self.workspaces.firstIndex(where: { $0.name == workspace }) {
+                    var updated = self.workspaces[idx]
+                    updated.dirtyCounts[repo] = files.count
+                    self.workspaces[idx] = updated
+                }
+            }
+        }
     }
     
     /// Doctor scan. Triggered by opening the Doctor tab or hitting Refresh there,

@@ -41,7 +41,7 @@ public struct WorkspaceInfo: Codable, Identifiable {
     public let path: String
     public let repos: [String]
     public let branches: [String: String]
-    public let dirtyCounts: [String: Int]
+    public var dirtyCounts: [String: Int]
     public let hasMcpIndex: Bool
     public let isStale: Bool
     public let lastModified: Date
