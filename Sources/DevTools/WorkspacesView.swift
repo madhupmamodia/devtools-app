@@ -782,12 +782,6 @@ struct WorkspacesRootView: View {
                 }
                 .controlSize(.small)
                 .disabled(store.isRunningDoctor)
-                if let checked = store.doctorCheckedAt {
-                    Text(checked, style: .relative)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .help("Last checked")
-                }
                 Button("Fix all missing") {
                     store.runDoctorFixes()
                 }
