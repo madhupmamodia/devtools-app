@@ -513,7 +513,11 @@ struct WorkspacesRootView: View {
                     .controlSize(.small)
 
                 Button(store.isSyncingRepos || store.isSyncingUsage ? "…" : "Sync") {
+                    // Refresh BOTH the repo list and the activity ranking. The ranking
+                    // used to survive the Sync untouched, so a stale cache kept the
+                    // list in alphabetical order with no way to force a refresh.
                     store.syncRepos()
+                    store.syncUsageIfStale(force: true)
                 }
                 .controlSize(.small)
                 .disabled(store.isSyncingRepos || store.isSyncingUsage)

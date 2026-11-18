@@ -96,9 +96,12 @@ public final class WorkspacesStore: ObservableObject {
     
     /// Fetches ranking in the background when the cache is missing or older than 7 days.
     /// ponytail: never blocks the UI on this — it costs ~12s of GitHub paging.
-    public func syncUsageIfStale(maxAgeDays: Int = 7) {
+    /// - Parameter force: refresh even when the cache is fresh. The Sync button uses
+    ///   this — the cache can be fresh but WRONG (e.g. written by an older build
+    ///   that could not read it back).
+    public func syncUsageIfStale(maxAgeDays: Int = 7, force: Bool = false) {
         guard !isSyncingUsage else { return }
-        if let cached = repoUsage,
+        if !force, let cached = repoUsage,
            Date().timeIntervalSince(cached.fetchedAt) < Double(maxAgeDays) * 86400 {
             return
         }
@@ -172,6 +175,10 @@ public final class WorkspacesStore: ObservableObject {
     public func refreshAll() {
         configuredRepos = engine.config.repos
         if repoUsage == nil { repoUsage = engine.loadRepoUsage() }
+        // Self-heal the ranking: if the cache is missing or older than a week,
+        // refresh it in the background. This was never wired up, so the ranking
+        // silently stayed whatever the cache happened to hold.
+        syncUsageIfStale()
         guard !isScanning else { return }
         isScanning = true
         let expanded = expandedRepo

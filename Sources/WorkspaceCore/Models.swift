@@ -91,6 +91,27 @@ public struct WorkspaceMeta: Codable {
     }
 }
 
+/// Shared JSON coders for the on-disk caches.
+///
+/// ponytail: the writer used `.iso8601` and the reader used the default (a Double
+/// timestamp), so every read of usage.json failed to decode. The ranking silently
+/// degraded to alphabetical with no error anywhere. One pair of coders, used by
+/// both sides, makes that class of bug impossible.
+public enum CacheCoders {
+    public static func encoder(pretty: Bool = true) -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = pretty ? .prettyPrinted : []
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+    
+    public static func decoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+}
+
 public enum ProcessRunner {
     /// Node major version the app prefers when several are installed via nvm.
     /// ponytail: one constant, not a settings screen. Bump it when the team moves on.

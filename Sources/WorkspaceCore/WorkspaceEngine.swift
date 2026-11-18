@@ -106,7 +106,7 @@ public final class WorkspaceEngine: @unchecked Sendable {
     
     public func loadRepoUsage() -> RepoUsage? {
         guard let data = try? Data(contentsOf: usageURL) else { return nil }
-        return try? JSONDecoder().decode(RepoUsage.self, from: data)
+        return try? CacheCoders.decoder().decode(RepoUsage.self, from: data)
     }
     
     /// Counts PRs and commits the signed-in user authored per repo in the org.
@@ -168,10 +168,7 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             prCounts: prs,
             commitCounts: commits
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .prettyPrinted
-        encoder.dateEncodingStrategy = .iso8601
-        if let data = try? encoder.encode(usage) {
+        if let data = try? CacheCoders.encoder().encode(usage) {
             try? data.write(to: usageURL)
         }
         return usage
@@ -414,15 +411,11 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
     
     public func loadDoctorSnapshot() -> DoctorSnapshot? {
         guard let data = try? Data(contentsOf: doctorSnapshotURL) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(DoctorSnapshot.self, from: data)
+        return try? CacheCoders.decoder().decode(DoctorSnapshot.self, from: data)
     }
     
     public func saveDoctorSnapshot(items: [DoctorItem]) {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(DoctorSnapshot(items: items, checkedAt: Date())) else { return }
+        guard let data = try? CacheCoders.encoder().encode(DoctorSnapshot(items: items, checkedAt: Date())) else { return }
         try? FileManager.default.createDirectory(
             atPath: (doctorSnapshotURL.deletingLastPathComponent().path),
             withIntermediateDirectories: true
@@ -585,14 +578,11 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
     
     public func readMeta(wsPath: String) -> WorkspaceMeta? {
         guard let data = try? Data(contentsOf: metaURL(wsPath: wsPath)) else { return nil }
-        return try? JSONDecoder().decode(WorkspaceMeta.self, from: data)
+        return try? CacheCoders.decoder().decode(WorkspaceMeta.self, from: data)
     }
     
     private func writeMeta(ticket: String, name: String, wsPath: String) {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .prettyPrinted
-        encoder.dateEncodingStrategy = .iso8601
-        if let data = try? encoder.encode(WorkspaceMeta(ticket: ticket, name: name)) {
+        if let data = try? CacheCoders.encoder().encode(WorkspaceMeta(ticket: ticket, name: name)) {
             try? data.write(to: metaURL(wsPath: wsPath))
         }
     }
