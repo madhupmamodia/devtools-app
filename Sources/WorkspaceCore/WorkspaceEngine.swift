@@ -184,139 +184,250 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
     }
     
     // MARK: - Doctor
+    
+    /// Cached Doctor result. The tab paints instantly with the last known state and
+    /// refreshes in the background, instead of showing a spinner for seconds.
+    public struct DoctorSnapshot: Codable {
+        public var items: [DoctorItem]
+        public var checkedAt: Date
+    }
+    
+    /// Runs every probe at once and returns the items in a stable order.
+    /// ponytail: sequential probes cost 4.4s (16 processes, two of them network).
+    /// Concurrent, the wall time is the slowest single probe.
+    private func runDoctorChecks(_ checks: [() -> DoctorItem]) -> [DoctorItem] {
+        final class Slot: @unchecked Sendable { var item: DoctorItem? }
+        let slots = checks.map { _ in Slot() }
+        let group = DispatchGroup()
+        for (i, check) in checks.enumerated() {
+            DispatchQueue.global(qos: .userInitiated).async(group: group) {
+                slots[i].item = check()
+            }
+        }
+        group.wait()
+        return slots.compactMap { $0.item }
+    }
+    
     public func checkDoctor() -> [DoctorItem] {
-        var items: [DoctorItem] = []
+        // Resolve binaries once. `which` walks the PATH on disk — no process spawn.
+        let gitPath = ProcessRunner.which("git")
+        let ghPath = ProcessRunner.which("gh")
+        let nodePath = ProcessRunner.which("node")
+        let pythonPath = ProcessRunner.which("python3")
+        let cbmPath = ProcessRunner.which("codebase-memory-mcp")
+        let wsPath = ProcessRunner.which("ws")
+        let opencodePath = ProcessRunner.which("opencode")
+        let claudePath = ProcessRunner.which("claude")
+        let codexPath = ProcessRunner.which("codex")
+        
+        func version(of path: String?, args: [String]) -> String? {
+            guard let path else { return nil }
+            let res = ProcessRunner.exec(path, args)
+            guard res.exitCode == 0 else { return nil }
+            return res.stdout.components(separatedBy: "\n").last
+        }
+        
+        func firstLine(of path: String?, args: [String]) -> String? {
+            guard let path else { return nil }
+            let res = ProcessRunner.exec(path, args)
+            guard res.exitCode == 0 else { return nil }
+            return res.stdout.components(separatedBy: "\n").first
+        }
+        
+        var checks: [() -> DoctorItem] = []
         
         // 1. Git
-        let gitRes = ProcessRunner.run("which git && git --version")
-        items.append(DoctorItem(
-            name: "git",
-            required: true,
-            installed: gitRes.exitCode == 0,
-            version: gitRes.stdout.components(separatedBy: "\n").last,
-            installCommand: "brew install git"
-        ))
+        checks.append {
+            DoctorItem(
+                name: "git",
+                required: true,
+                installed: gitPath != nil,
+                version: version(of: gitPath, args: ["--version"]),
+                details: gitPath,
+                installCommand: "brew install git"
+            )
+        }
         
-        // 2. GitHub CLI & Auth
-        let ghRes = ProcessRunner.run("which gh && gh --version")
-        let ghAuth = ProcessRunner.run("gh auth status")
-        let ghInstalled = ghRes.exitCode == 0
-        items.append(DoctorItem(
-            name: "gh (GitHub CLI)",
-            required: true,
-            installed: ghInstalled,
-            version: ghRes.stdout.components(separatedBy: "\n").first,
-            details: ghAuth.exitCode == 0 ? "Authenticated" : "Not authenticated (run 'gh auth login')",
-            installCommand: "brew install gh && gh auth login"
-        ))
+        // 2. GitHub CLI & auth. `gh auth token` reads local config; `gh auth status`
+        // contacts the API and costs 600ms.
+        checks.append {
+            let authed = ghPath.map { ProcessRunner.exec($0, ["auth", "token"]).exitCode == 0 } ?? false
+            return DoctorItem(
+                name: "gh (GitHub CLI)",
+                required: true,
+                installed: ghPath != nil,
+                version: version(of: ghPath, args: ["--version"]),
+                details: authed ? "Authenticated" : "Not authenticated (run 'gh auth login')",
+                installCommand: "brew install gh && gh auth login"
+            )
+        }
         
-        // 3. Git clone auth. Verifies a real private repo is actually readable over
-        // the transport we use, so broken SSH keys surface here instead of mid-clone.
-        let probeRepo = config.repos.first?.name ?? ""
-        if !probeRepo.isEmpty {
-            let sshProbe = ProcessRunner.run("GIT_SSH_COMMAND='ssh -o BatchMode=yes' git ls-remote git@github.com:\(config.defaultOrg)/\(probeRepo).git HEAD", timeout: 20)
-            let httpsProbe = ProcessRunner.run("git ls-remote https://github.com/\(config.defaultOrg)/\(probeRepo).git HEAD", timeout: 20)
-            let sshOK = sshProbe.exitCode == 0
-            let httpsOK = httpsProbe.exitCode == 0
-            items.append(DoctorItem(
+        // 3. Git clone transport. HTTPS first: it is the transport we actually use,
+        // and it works without a key. SSH is only probed when HTTPS fails, which
+        // saves a network round trip on every check.
+        checks.append {
+            let probeRepo = self.config.repos.first?.name ?? ""
+            guard !probeRepo.isEmpty, let gitPath else {
+                return DoctorItem(name: "Git clone auth", required: true, installed: false, installCommand: "gh auth setup-git")
+            }
+            let remote = "\(self.config.defaultOrg)/\(probeRepo)"
+            let https = ProcessRunner.exec(gitPath, ["ls-remote", "https://github.com/\(remote).git", "HEAD"], timeout: 20)
+            if https.exitCode == 0 {
+                return DoctorItem(
+                    name: "Git clone auth",
+                    required: true,
+                    installed: true,
+                    details: "HTTPS + gh token"
+                )
+            }
+            // HTTPS failed — check whether SSH can pick up the slack.
+            // core.sshCommand instead of GIT_SSH_COMMAND: setting a per-spawn
+            // environment is not thread-safe (see ProcessRunner).
+            let ssh = ProcessRunner.exec(
+                gitPath,
+                ["-c", "core.sshCommand=ssh -o BatchMode=yes", "ls-remote", "git@github.com:\(remote).git", "HEAD"],
+                timeout: 20
+            )
+            return DoctorItem(
                 name: "Git clone auth",
                 required: true,
-                installed: sshOK || httpsOK,
-                version: nil,
-                details: sshOK
-                    ? "SSH key works"
-                    : (httpsOK ? "SSH key missing; using HTTPS + gh token" : "No working transport"),
-                installCommand: sshOK ? nil : "gh auth setup-git"
-            ))
+                installed: ssh.exitCode == 0,
+                details: ssh.exitCode == 0 ? "SSH key works" : "No working transport",
+                installCommand: ssh.exitCode == 0 ? nil : "gh auth setup-git"
+            )
         }
         
-        // 4. Node.js & npm
-        let nodeRes = ProcessRunner.run("which node && node -v")
-        items.append(DoctorItem(
-            name: "node",
-            required: true,
-            installed: nodeRes.exitCode == 0,
-            version: nodeRes.stdout.components(separatedBy: "\n").last,
-            details: nodeRes.stdout.components(separatedBy: "\n").first,
-            installCommand: "brew install node"
-        ))
+        // 4. Node.js
+        checks.append {
+            DoctorItem(
+                name: "node",
+                required: true,
+                installed: nodePath != nil,
+                version: version(of: nodePath, args: ["-v"]),
+                details: nodePath,
+                installCommand: "brew install node"
+            )
+        }
         
-        // 4. Python 3
-        let pyRes = ProcessRunner.run("which python3 && python3 --version")
-        items.append(DoctorItem(
-            name: "python3",
-            required: true,
-            installed: pyRes.exitCode == 0,
-            version: pyRes.stdout.components(separatedBy: "\n").last,
-            installCommand: "brew install python3"
-        ))
+        // 5. Python 3
+        checks.append {
+            DoctorItem(
+                name: "python3",
+                required: true,
+                installed: pythonPath != nil,
+                version: version(of: pythonPath, args: ["--version"]),
+                details: pythonPath,
+                installCommand: "brew install python3"
+            )
+        }
         
-        // 5. codebase-memory-mcp
-        let cbmRes = ProcessRunner.run("which codebase-memory-mcp")
-        let cbmInstalled = cbmRes.exitCode == 0
-        items.append(DoctorItem(
-            name: "codebase-memory-mcp",
-            required: true,
-            installed: cbmInstalled,
-            version: cbmInstalled ? ProcessRunner.run("codebase-memory-mcp --version").stdout : nil,
-            details: cbmInstalled ? "Ready for AST indexing" : "Required for AI agent cross-repo graph",
-            installCommand: "npm install -g codebase-memory-mcp"
-        ))
+        // 6. codebase-memory-mcp
+        checks.append {
+            DoctorItem(
+                name: "codebase-memory-mcp",
+                required: true,
+                installed: cbmPath != nil,
+                version: version(of: cbmPath, args: ["--version"]),
+                details: cbmPath != nil ? "Ready for AST indexing" : "Required for AI agent cross-repo graph",
+                installCommand: "npm install -g codebase-memory-mcp"
+            )
+        }
         
-        // 6. Terminals. iTerm2 preferred when present; plain Terminal always exists.
-        let iterm = ProcessRunner.run("test -d /Applications/iTerm.app")
-        items.append(DoctorItem(
-            name: "iTerm2",
-            required: false,
-            installed: iterm.exitCode == 0,
-            version: nil,
-            details: iterm.exitCode == 0 ? "Preferred terminal for 'Open in'" : "Not installed — falling back to Terminal.app",
-            installCommand: "brew install --cask iterm2"
-        ))
+        // 7. Terminals. iTerm2 preferred when present; plain Terminal always exists.
+        checks.append {
+            let hasITerm = FileManager.default.fileExists(atPath: "/Applications/iTerm.app")
+            return DoctorItem(
+                name: "iTerm2",
+                required: false,
+                installed: hasITerm,
+                details: hasITerm ? "Preferred terminal for 'Open in'" : "Not installed — falling back to Terminal.app",
+                installCommand: "brew install --cask iterm2"
+            )
+        }
         
-        // 7. Our own CLI. Self-check that the bundle's ws binary is still linked on PATH;
+        // 8. Our own CLI. Self-check that the bundle's ws binary is still linked on PATH;
         // reinstalling or cleaning PATH breaks it silently.
-        let wsRes = ProcessRunner.run("which ws")
-        let wsFound = wsRes.exitCode == 0
-        items.append(DoctorItem(
-            name: "ws CLI",
-            required: true,
-            installed: wsFound,
-            version: wsFound ? ProcessRunner.run("ws --help").stdout.components(separatedBy: "\n").first : nil,
-            details: wsFound
-                ? "Workspace orchestrator available in Terminal"
-                : (bundledWSPath.map { "Bundled at \($0)" } ?? "Not linked on PATH"),
-            installCommand: bundledWSPath.map { src in
-                "mkdir -p \"$HOME/.local/bin\" && cp \"\(src)\" \"$HOME/.local/bin/ws\" && chmod +x \"$HOME/.local/bin/ws\""
-            }
-        ))
+        checks.append {
+            DoctorItem(
+                name: "ws CLI",
+                required: true,
+                installed: wsPath != nil,
+                version: firstLine(of: wsPath, args: ["--help"]),
+                details: wsPath != nil
+                    ? "Workspace orchestrator available in Terminal"
+                    : (self.bundledWSPath.map { "Bundled at \($0)" } ?? "Not linked on PATH"),
+                installCommand: self.bundledWSPath.map { src in
+                    "mkdir -p \"$HOME/.local/bin\" && cp \"\(src)\" \"$HOME/.local/bin/ws\" && chmod +x \"$HOME/.local/bin/ws\""
+                }
+            )
+        }
         
-        // 6. Coding agents (optional — user installs only what they want).
+        // 9. Coding agents (optional — user installs only what they want).
         // ponytail: macOS filesystem is case-insensitive, so /Applications/OpenCode.app
         // and /Applications/opencode.app are the same app. Only check one.
-        let agents: [(String, String, String?, String)] = [
-            ("OpenCode", "opencode --version", "npm install -g opencode-ai", "CLI agent (TUI)"),
-            ("OpenCode Desktop", "test -d /Applications/OpenCode.app", "brew install --cask opencode", "Desktop app"),
-            ("Claude Code", "claude --version", "npm install -g @anthropic-ai/claude-code", "CLI agent"),
-            ("Cursor", "test -d /Applications/Cursor.app", "brew install --cask cursor", "Desktop editor"),
-            ("Codex", "codex --version", "npm install -g @openai/codex", "CLI agent")
+        let agentChecks: [(String, String?, [String], String?, String)] = [
+            ("OpenCode", opencodePath, ["--version"], "npm install -g opencode-ai", "CLI agent (TUI)"),
+            ("OpenCode Desktop", nil, [], "brew install --cask opencode", "Desktop app"),
+            ("Claude Code", claudePath, ["--version"], "npm install -g @anthropic-ai/claude-code", "CLI agent"),
+            ("Codex", codexPath, ["--version"], "npm install -g @openai/codex", "CLI agent")
         ]
-        
-        for (agentName, checkCmd, installCmd, note) in agents {
-            let res = ProcessRunner.run(checkCmd, timeout: 15)
-            let found = res.exitCode == 0
-            items.append(DoctorItem(
-                name: agentName,
+        for (name, path, args, installCmd, note) in agentChecks {
+            checks.append {
+                // Desktop apps are a filesystem check, not a process spawn.
+                if name == "OpenCode Desktop" {
+                    let hasApp = FileManager.default.fileExists(atPath: "/Applications/OpenCode.app")
+                    return DoctorItem(
+                        name: name, required: false, installed: hasApp,
+                        details: hasApp ? note : "Not installed", installCommand: installCmd, category: "agent"
+                    )
+                }
+                let ver = version(of: path, args: args)
+                return DoctorItem(
+                    name: name, required: false, installed: path != nil,
+                    version: ver, details: note, installCommand: installCmd, category: "agent"
+                )
+            }
+        }
+        // Cursor is a desktop app too.
+        checks.append {
+            let hasCursor = FileManager.default.fileExists(atPath: "/Applications/Cursor.app")
+            return DoctorItem(
+                name: "Cursor",
                 required: false,
-                installed: found,
-                version: found ? res.stdout.components(separatedBy: "\n").last : nil,
-                details: found ? note : note,
-                installCommand: installCmd,
+                installed: hasCursor,
+                details: hasCursor ? "Desktop editor" : "Not installed",
+                installCommand: "brew install --cask cursor",
                 category: "agent"
-            ))
+            )
         }
         
-        return items
+        return runDoctorChecks(checks)
+    }
+    
+    // MARK: - Doctor cache
+    
+    private var doctorSnapshotURL: URL {
+        // Keep it beside the rest of the ws state.
+        let configDir = (NSHomeDirectory() as NSString).appendingPathComponent(".config/ws")
+        return URL(fileURLWithPath: (configDir as NSString).appendingPathComponent("doctor.json"))
+    }
+    
+    public func loadDoctorSnapshot() -> DoctorSnapshot? {
+        guard let data = try? Data(contentsOf: doctorSnapshotURL) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(DoctorSnapshot.self, from: data)
+    }
+    
+    public func saveDoctorSnapshot(items: [DoctorItem]) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(DoctorSnapshot(items: items, checkedAt: Date())) else { return }
+        try? FileManager.default.createDirectory(
+            atPath: (doctorSnapshotURL.deletingLastPathComponent().path),
+            withIntermediateDirectories: true
+        )
+        try? data.write(to: doctorSnapshotURL)
     }
     
     public func fixDoctor(item: DoctorItem, onOutput: ((String) -> Void)? = nil) -> Bool {

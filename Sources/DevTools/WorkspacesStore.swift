@@ -13,6 +13,7 @@ public final class WorkspacesStore: ObservableObject {
     @Published public var isRunningDoctor: Bool = false
     @Published public var installingItemID: String?
     @Published public var isScanning: Bool = false
+    @Published public var doctorCheckedAt: Date?
     @Published public var isProvisioning: Bool = false
     @Published public var statusMessage: String?
     @Published public var statusError: String?
@@ -68,15 +69,30 @@ public final class WorkspacesStore: ObservableObject {
     /// Repos matching the search box, always ranked by the signed-in user's own
     /// GitHub activity. No toggle: alphabetical order of 379 repos is never the
     /// useful default.
+    ///
+    /// ponytail: the sort is cached. It used to run on every access, and SwiftUI
+    /// reads this from several places per frame (ForEach body, select-all state,
+    /// counts). Sorting 379 repos per frame is pure waste.
     public var visibleRepos: [RepoDefinition] {
         let q = repoSearchText.trimmingCharacters(in: .whitespaces).lowercased()
+        let cacheKey = "\(q)|\(configuredRepos.count)|\(usageRevision)"
+        if let cached = visibleReposCache, cached.key == cacheKey {
+            return cached.repos
+        }
+        
         let list = q.isEmpty ? configuredRepos : configuredRepos.filter { $0.name.lowercased().contains(q) }
-        return list.sorted { a, b in
+        let sorted = list.sorted { a, b in
             let sa = usageScore(for: a.name), sb = usageScore(for: b.name)
             if sa != sb { return sa > sb }
             return a.name < b.name
         }
+        visibleReposCache = (key: cacheKey, repos: sorted)
+        return sorted
     }
+    
+    /// Bumped whenever the ranking changes, so the cached order is invalidated.
+    private var usageRevision: Int = 0
+    private var visibleReposCache: (key: String, repos: [RepoDefinition])?
     
     /// Fetches ranking in the background when the cache is missing or older than 7 days.
     /// ponytail: never blocks the UI on this — it costs ~12s of GitHub paging.
@@ -91,6 +107,7 @@ public final class WorkspacesStore: ObservableObject {
             let usage = engine.syncRepoUsage()
             await MainActor.run {
                 self.repoUsage = usage
+                self.usageRevision += 1
                 self.isSyncingUsage = false
                 if usage == nil {
                     self.fail("Could not read GitHub activity. Check 'gh auth status'.", owner: .create)
@@ -215,16 +232,39 @@ public final class WorkspacesStore: ObservableObject {
     
     /// Doctor scan. Triggered by opening the Doctor tab or hitting Refresh there,
     /// not by every tab switch.
-    public func refreshDoctor() {
+    ///
+    /// The tab paints from the cached snapshot immediately, then re-checks in the
+    /// background. A full check costs ~1.3s (network probe included) and the user
+    /// should never stare at a spinner for it.
+    public func refreshDoctor(force: Bool = false) {
         guard !isRunningDoctor else { return }
+        if !force, let snapshot = engine.loadDoctorSnapshot() {
+            doctorItems = snapshot.items
+            doctorCheckedAt = snapshot.checkedAt
+            // Fresh enough — nothing to do.
+            if Date().timeIntervalSince(snapshot.checkedAt) < 300 {
+                return
+            }
+        }
         isRunningDoctor = true
         Task.detached { [engine = self.engine] in
             let items = engine.checkDoctor()
             await MainActor.run {
                 self.doctorItems = items
+                self.doctorCheckedAt = Date()
                 self.isRunningDoctor = false
             }
+            engine.saveDoctorSnapshot(items: items)
         }
+    }
+    
+    /// Called when the Doctor tab becomes visible. Shows the cached result at once.
+    public func doctorTabAppeared() {
+        if let snapshot = engine.loadDoctorSnapshot() {
+            doctorItems = snapshot.items
+            doctorCheckedAt = snapshot.checkedAt
+        }
+        refreshDoctor()
     }
     
     public func syncReposAndUsage() {

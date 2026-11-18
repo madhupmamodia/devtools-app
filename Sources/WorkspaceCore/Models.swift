@@ -158,6 +158,19 @@ public enum ProcessRunner {
         return (paths + base.components(separatedBy: ":")).joined(separator: ":")
     }()
     
+    /// Publishes the enriched PATH to this process, so every child inherits it.
+    ///
+    /// ponytail: do NOT set `Process.environment` per spawn. Foundation's
+    /// implementation of an explicit environment is not thread-safe: running
+    /// several spawns concurrently corrupts the child's environment (observed:
+    /// "/Users/madhup" arriving as "/Usersadhup") and can hang outright.
+    /// Mutating the process environment once, before any spawn, is safe and gives
+    /// every child the same PATH.
+    private static let environmentReady: Bool = {
+        setenv("PATH", enrichedPath, 1)
+        return true
+    }()
+    
     /// Runs several commands at once, one per working directory, concurrently.
     /// Results come back in the same order as the inputs.
     /// ponytail: spawn cost dominates for short git commands, so overlap them.
@@ -184,47 +197,85 @@ public enum ProcessRunner {
         return results
     }
     
+    /// Runs a command through the shell.
     public static func run(_ command: String, currentDirectory: String? = nil, timeout: TimeInterval? = nil) -> (exitCode: Int32, stdout: String, stderr: String) {
+        spawn(executable: "/bin/zsh", arguments: ["-c", command], currentDirectory: currentDirectory, timeout: timeout)
+    }
+    
+    /// Runs a binary directly — no shell, no shell startup cost.
+    /// Prefer this over `run(_:)` for anything simple: a shell spawn costs ~10ms
+    /// before the command even starts.
+    public static func exec(_ executable: String, _ arguments: [String] = [], currentDirectory: String? = nil, timeout: TimeInterval? = nil) -> (exitCode: Int32, stdout: String, stderr: String) {
+        spawn(executable: executable, arguments: arguments, currentDirectory: currentDirectory, timeout: timeout)
+    }
+    
+    /// Finds an executable on the enriched PATH without spawning a process.
+    public static func which(_ name: String) -> String? {
+        if name.contains("/") {
+            return FileManager.default.isExecutableFile(atPath: name) ? name : nil
+        }
+        for dir in enrichedPath.components(separatedBy: ":") where !dir.isEmpty {
+            let candidate = (dir as NSString).appendingPathComponent(name)
+            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+        }
+        return nil
+    }
+    
+    /// Core spawn.
+    ///
+    /// ponytail: `Process.waitUntilExit()` costs ~52ms of pure latency on macOS — it
+    /// polls for the child instead of being notified. The termination handler fires
+    /// in ~1ms. Every git/gh/node call was paying that tax, and the Doctor alone
+    /// makes 16 of them. Measured on this machine: 68ms -> 1ms for a fast command.
+    ///
+    /// ponytail: output goes to a temp file, not a Pipe. Concurrent Pipe reads on
+    /// Darwin are not safe — they corrupted output ("/Users/madhup" arriving as
+    /// "/Usersadhup") and a burst of 60 concurrent reads was killed by the kernel.
+    /// A temp file has no EOF handshake and no shared Foundation state.
+    private static func spawn(
+        executable: String,
+        arguments: [String],
+        currentDirectory: String?,
+        timeout: TimeInterval?
+    ) -> (exitCode: Int32, stdout: String, stderr: String) {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-c", command]
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
         
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = enrichedPath
-        process.environment = env
+        // Touch the static so PATH is published before the first spawn.
+        _ = environmentReady
         
         if let currentDirectory {
             process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
         }
         
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
+        let tmpDir = NSTemporaryDirectory()
+        let outURL = URL(fileURLWithPath: tmpDir).appendingPathComponent("ws-out-\(UUID().uuidString)")
+        let errURL = URL(fileURLWithPath: tmpDir).appendingPathComponent("ws-err-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: outURL.path, contents: nil)
+        FileManager.default.createFile(atPath: errURL.path, contents: nil)
         
-        // Drain both pipes on background queues BEFORE waiting. Calling waitUntilExit()
-        // first deadlocks on any command that writes more than the 64KB pipe buffer:
-        // the child blocks on write, never exits. ponytail: don't "optimize" this back.
-        var outData = Data()
-        var errData = Data()
-        let group = DispatchGroup()
-        let queue = DispatchQueue(label: "ws.proc", attributes: .concurrent)
+        guard let outHandle = FileHandle(forWritingAtPath: outURL.path),
+              let errHandle = FileHandle(forWritingAtPath: errURL.path) else {
+            return (-1, "", "Could not create output file for \(executable)")
+        }
+        process.standardOutput = outHandle
+        process.standardError = errHandle
         
-        queue.async(group: group) {
-            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        }
-        queue.async(group: group) {
-            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        }
+        // Fast exit notification. Foundation delivers this on a private queue, so it
+        // is safe to block the calling thread waiting on the semaphore.
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         
         do {
             try process.run()
+            
             // ponytail: network probes can hang forever without this. Kill the child
             // and return what we got so far rather than freezing the UI thread.
             if let timeout {
                 let deadline = Date().addingTimeInterval(timeout)
                 while process.isRunning && Date() < deadline {
-                    usleep(50_000)
+                    usleep(20_000)
                 }
                 if process.isRunning {
                     process.terminate()
@@ -232,14 +283,35 @@ public enum ProcessRunner {
                     if process.isRunning { kill(process.processIdentifier, SIGKILL) }
                 }
             }
-            process.waitUntilExit()
-            // Drains finish once the child closed its pipes (i.e. after exit). Must come
-            // AFTER the kill logic or a hung child blocks here forever, defeating timeout.
-            group.wait()
-            let stdout = String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let stderr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return (process.terminationStatus, stdout, stderr)
+            
+            // Wait for the child. The handler is the fast path. If it was missed
+            // (a child that exits before Foundation registers the handler) fall back
+            // to polling isRunning, and only then to waitUntilExit().
+            if exited.wait(timeout: .now() + 0.05) != .success {
+                while process.isRunning {
+                    if exited.wait(timeout: .now() + 0.05) == .success { break }
+                }
+                if exited.wait(timeout: .now()) != .success {
+                    process.waitUntilExit()
+                }
+            }
+            
+            try? outHandle.close()
+            try? errHandle.close()
+            let stdout = (try? String(contentsOf: outURL, encoding: .utf8)) ?? ""
+            let stderr = (try? String(contentsOf: errURL, encoding: .utf8)) ?? ""
+            try? FileManager.default.removeItem(atPath: outURL.path)
+            try? FileManager.default.removeItem(atPath: errURL.path)
+            return (
+                process.terminationStatus,
+                stdout.trimmingCharacters(in: .whitespacesAndNewlines),
+                stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
         } catch {
+            try? outHandle.close()
+            try? errHandle.close()
+            try? FileManager.default.removeItem(atPath: outURL.path)
+            try? FileManager.default.removeItem(atPath: errURL.path)
             return (-1, "", error.localizedDescription)
         }
     }

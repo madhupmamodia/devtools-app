@@ -53,6 +53,7 @@ struct WorkspacesRootView: View {
                 workspaceCreateView
             case .doctor:
                 doctorView
+                    .onAppear { store.doctorTabAppeared() }
             }
 
             Divider().padding(.vertical, 2)
@@ -773,10 +774,16 @@ struct WorkspacesRootView: View {
                     .font(.headline)
                 Spacer()
                 Button(store.isRunningDoctor ? "Checking…" : "Re-check") {
-                    store.refreshDoctor()
+                    store.refreshDoctor(force: true)
                 }
                 .controlSize(.small)
                 .disabled(store.isRunningDoctor)
+                if let checked = store.doctorCheckedAt {
+                    Text(checked, style: .relative)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .help("Last checked")
+                }
                 Button("Fix all missing") {
                     store.runDoctorFixes()
                 }

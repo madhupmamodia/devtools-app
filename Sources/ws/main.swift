@@ -128,6 +128,7 @@ struct WSCli {
     
     static func handleDoctor(engine: WorkspaceEngine, fix: Bool, json: Bool) {
         var items = engine.checkDoctor()
+        engine.saveDoctorSnapshot(items: items)
         
         if fix {
             print("Applying fixes for missing components...")
@@ -137,6 +138,7 @@ struct WSCli {
                 }
             }
             items = engine.checkDoctor()
+            engine.saveDoctorSnapshot(items: items)
         }
         
         if json {

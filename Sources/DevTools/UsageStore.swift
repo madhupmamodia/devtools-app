@@ -194,12 +194,21 @@ final class UsageStore: ObservableObject {
     }
 
     func refreshCurrentTab() async {
+        // ponytail: a refresh on every tab switch hammers the gateway for data the
+        // user may not even look at. One fetch per tab per minute is plenty.
+        let now = Date()
+        if let last = lastTabRefresh[activeTab], now.timeIntervalSince(last) < 60 {            return
+        }
+        lastTabRefresh[activeTab] = now
         switch activeTab {
         case .overview: await refreshOverview()
         case .insights: await refreshInsights()
         case .models: await refreshModels()
         }
     }
+
+    /// Last refresh per tab, used to rate-limit tab switches.
+    private var lastTabRefresh: [AppTab: Date] = [:]
 
     private func loadModelsCache() {
         guard let data = try? Data(contentsOf: modelsPath),
@@ -423,14 +432,16 @@ final class UsageStore: ObservableObject {
 
     func startPolling() {
         Task {
-            await refreshOverview()
-            await refreshInsights()
+            await refreshCurrentTab()
         }
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             Task { @MainActor in
-                await self.refreshOverview()
-                await self.refreshInsights()
+                // ponytail: only refresh the tab the user is looking at. The old
+                // timer fetched overview AND insights every 5 minutes regardless
+                // of which tab was open — two gateway round trips for data that
+                // was never displayed.
+                await self.refreshCurrentTab()
             }
         }
     }
