@@ -619,7 +619,7 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         ticket: String,
         name: String,
         selectedRepoNames: [String],
-        onProgress: @escaping (ProvisionEvent) -> Void
+        onProgress: @Sendable @escaping (ProvisionEvent) -> Void
     ) throws -> String {
         let cleanTicket = ticket.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !cleanTicket.isEmpty else {
@@ -650,13 +650,13 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             throw NSError(domain: "ws", code: 3, userInfo: [NSLocalizedDescriptionKey: "No valid repositories selected."])
         }
         
-        var provisioned: [String] = []
-        var skipped: [(String, String)] = []
-        for repo in repoDefs {
-            onProgress(.repoStarted(repo.name))
-            let ok = try provision(repo: repo, ticket: cleanTicket, into: wsPath, onProgress: onProgress)
-            if ok { provisioned.append(repo.name) } else { skipped.append((repo.name, "empty repository")) }
-        }
+        let provisioned = try provisionRepos(
+            repoDefs,
+            ticket: cleanTicket,
+            into: wsPath,
+            skipExistingWorktree: false,
+            onProgress: onProgress
+        )
         if provisioned.isEmpty {
             throw NSError(domain: "ws", code: 11, userInfo: [NSLocalizedDescriptionKey: "None of the selected repositories could be provisioned. They may all be empty."])
         }
@@ -678,7 +678,7 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
     public func addRepos(
         toWorkspace workspaceName: String,
         repoNames: [String],
-        onProgress: @escaping (ProvisionEvent) -> Void
+        onProgress: @Sendable @escaping (ProvisionEvent) -> Void
     ) throws {
         let wsRoot = (config.rootDirectory as NSString).expandingTildeInPath
         let wsPath = (wsRoot as NSString).appendingPathComponent(workspaceName)
@@ -691,17 +691,14 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
             throw NSError(domain: "ws", code: 3, userInfo: [NSLocalizedDescriptionKey: "No valid repositories selected."])
         }
         
-        var added: [String] = []
-        for repo in repoDefs {
-            let target = (wsPath as NSString).appendingPathComponent(repo.name)
-            if FileManager.default.fileExists(atPath: target) {
-                onProgress(.repoPhase(repo.name, .indexed))
-                continue
-            }
-            onProgress(.repoStarted(repo.name))
-            let ok = try provision(repo: repo, ticket: resolveTicket(workspaceName: workspaceName), into: wsPath, onProgress: onProgress)
-            if ok { added.append(repo.name) }
-        }
+        let ticket = resolveTicket(workspaceName: workspaceName)
+        let added = try provisionRepos(
+            repoDefs,
+            ticket: ticket,
+            into: wsPath,
+            skipExistingWorktree: true,
+            onProgress: onProgress
+        )
         
         guard !added.isEmpty else {
             onProgress(.complete)
@@ -719,6 +716,73 @@ func count(endpoint: String, query: String, repoExpr: String) -> [String: Int] {
         onProgress(.indexing)
         _ = reindexWorkspace(workspacePath: wsPath)
         onProgress(.complete)
+    }
+    
+    /// Provisions multiple repos concurrently (capped at 4 workers so GitHub
+    /// network and pack decompression stay fast without thrashing). Waits for
+    /// all in-flight repos to finish before propagating any error.
+    private func provisionRepos(
+        _ repoDefs: [RepoDefinition],
+        ticket: String,
+        into wsPath: String,
+        skipExistingWorktree: Bool,
+        onProgress: @Sendable @escaping (ProvisionEvent) -> Void
+    ) throws -> [String] {
+        let cacheRoot = (config.cacheDirectory as NSString).expandingTildeInPath
+        try FileManager.default.createDirectory(atPath: cacheRoot, withIntermediateDirectories: true)
+        
+        final class Slot: @unchecked Sendable {
+            var name: String?
+            var error: Error?
+        }
+        let slots = repoDefs.map { _ in Slot() }
+        let progressLock = NSLock()
+        let emit: @Sendable (ProvisionEvent) -> Void = { ev in
+            progressLock.lock()
+            onProgress(ev)
+            progressLock.unlock()
+        }
+        
+        let maxConcurrency = min(4, max(1, repoDefs.count))
+        let semaphore = DispatchSemaphore(value: maxConcurrency)
+        let group = DispatchGroup()
+        let queue = DispatchQueue.global(qos: .userInitiated)
+        
+        for (i, repo) in repoDefs.enumerated() {
+            queue.async(group: group) {
+                semaphore.wait()
+                defer { semaphore.signal() }
+                
+                if skipExistingWorktree {
+                    let target = (wsPath as NSString).appendingPathComponent(repo.name)
+                    if FileManager.default.fileExists(atPath: target) {
+                        emit(.repoPhase(repo.name, .indexed))
+                        return
+                    }
+                }
+                
+                emit(.repoStarted(repo.name))
+                do {
+                    let ok = try self.provision(repo: repo, ticket: ticket, into: wsPath, onProgress: emit)
+                    if ok { slots[i].name = repo.name }
+                } catch {
+                    slots[i].error = error
+                }
+            }
+        }
+        
+        group.wait()
+        
+        let errors = slots.compactMap { $0.error }
+        if let firstError = errors.first {
+            if errors.count == 1 {
+                throw firstError
+            }
+            let combined = errors.map { $0.localizedDescription }.joined(separator: "\n")
+            throw NSError(domain: "ws", code: 5, userInfo: [NSLocalizedDescriptionKey: combined])
+        }
+        
+        return slots.compactMap { $0.name }
     }
     
     // MARK: - Shared per-repo provisioning

@@ -44,8 +44,8 @@ struct WSCli {
             let wsName = args[1]
             let repos = Array(args.dropFirst(2)).filter { !$0.hasPrefix("-") }
             do {
-                try engine.addRepos(toWorkspace: wsName, repoNames: repos) { progress in
-                    print("  -> \(progress)")
+                try engine.addRepos(toWorkspace: wsName, repoNames: repos) { ev in
+                    print("  -> \(describe(ev))")
                 }
                 print("\nDone. Added to \(wsName): \(repos.joined(separator: ", "))")
             } catch {

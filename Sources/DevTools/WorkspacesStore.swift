@@ -330,7 +330,7 @@ public final class WorkspacesStore: ObservableObject {
         Task.detached { [engine = self.engine] in
             do {
                 try engine.addRepos(toWorkspace: name, repoNames: repos) { ev in
-                    Task { @MainActor in self.apply(ev) }
+                    DispatchQueue.main.async { self.apply(ev) }
                 }
                 await MainActor.run {
                     self.isAddingRepos = false
@@ -623,7 +623,7 @@ public final class WorkspacesStore: ObservableObject {
         Task.detached { [engine = self.engine] in
             do {
                 _ = try engine.createWorkspace(ticket: ticket, name: name, selectedRepoNames: repos) { ev in
-                    Task { @MainActor in self.apply(ev) }
+                    DispatchQueue.main.async { self.apply(ev) }
                 }
                 await MainActor.run {
                     self.isProvisioning = false
@@ -653,7 +653,7 @@ public final class WorkspacesStore: ObservableObject {
         case .complete:
             ap.indexing = false
             ap.finished = true
-            ap.repos = ap.repos.map { RepoProgress(repo: $0.repo, phase: .indexed) }
+            ap.repos = ap.repos.map { $0.phase == .skipped ? $0 : RepoProgress(repo: $0.repo, phase: .indexed) }
             // Hand over to the real workspace card once the user has seen "Ready".
             provisionClearTask?.cancel()
             provisionClearTask = Task { [weak self] in

@@ -22,7 +22,7 @@ public struct DoctorItem: Codable, Identifiable, Sendable {
     }
 }
 
-public struct RepoDefinition: Codable, Identifiable {
+public struct RepoDefinition: Codable, Identifiable, Sendable {
     public var id: String { name }
     public let name: String
     public let cloneUrl: String
